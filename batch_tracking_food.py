@@ -2,8 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-Batch Worm Tracker - Automated processing of multiple image directories
+Enhanced Batch Worm Tracker - Automated processing with adjustable parameters
 Extracts core functionality from the main WormTracker for automated processing
+Now includes GUI controls for all tracking parameters
 """
 
 import os
@@ -638,12 +639,12 @@ class BatchWormTracker:
 
 
 class BatchWormTrackerGUI:
-    """GUI for batch processing multiple directories"""
+    """Enhanced GUI for batch processing with adjustable parameters"""
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Batch Worm Tracker - Multiple Directory Processing")
-        self.root.geometry("1000x700")
+        self.root.title("Enhanced Batch Worm Tracker - Multiple Directory Processing with Adjustable Parameters")
+        self.root.geometry("1200x800")
 
         self.config = BatchConfig()
         self.tracker = BatchWormTracker(self.config)
@@ -654,29 +655,235 @@ class BatchWormTrackerGUI:
         self.setup_gui()
 
     def setup_gui(self):
-        """Setup the GUI interface"""
-        # Main frame
+        """Setup the enhanced GUI interface"""
+        # Main frame with notebook for tabbed interface
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
-        main_frame.columnconfigure(1, weight=1)
-        main_frame.rowconfigure(2, weight=1)
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(0, weight=1)
 
-        # Configuration section
-        config_frame = ttk.LabelFrame(main_frame, text="Batch Configuration (Using Default Settings)", padding="10")
-        config_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        # Create notebook for tabs
+        self.notebook = ttk.Notebook(main_frame)
+        self.notebook.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
-        ttk.Label(config_frame, text=f"Threshold Range: {self.config.threshold_min}-{self.config.threshold_max}").pack(anchor='w')
-        ttk.Label(config_frame, text=f"Blob Size: {self.config.min_blob_size}-{self.config.max_blob_size} pixels").pack(anchor='w')
-        ttk.Label(config_frame, text=f"Max Distance: {self.config.max_distance} px, Trajectory Weight: {self.config.trajectory_weight}").pack(anchor='w')
-        ttk.Label(config_frame, text=f"Min Track Length: {self.config.min_track_length} frames").pack(anchor='w')
-        ttk.Label(config_frame, text=f"Nose Detection: {'Enabled' if self.config.nose_detection_enabled else 'Disabled'}").pack(anchor='w')
-        ttk.Label(config_frame, text="Output: tracks.csv saved to each directory (overwrites existing)").pack(anchor='w')
+        # Tab 1: Parameter Configuration
+        self.config_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.config_tab, text="1. Configuration")
+        self.create_config_tab()
+
+        # Tab 2: Batch Processing
+        self.batch_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.batch_tab, text="2. Batch Processing")
+        self.create_batch_tab()
+
+        # Tab 3: Results
+        self.results_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.results_tab, text="3. Results")
+        self.create_results_tab()
+
+    def create_config_tab(self):
+        """Create the parameter configuration tab"""
+        # Main scrollable frame
+        canvas = tk.Canvas(self.config_tab)
+        scrollbar = ttk.Scrollbar(self.config_tab, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # Bind mousewheel
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        canvas.bind("<MouseWheel>", _on_mousewheel)
+
+        # Configuration sections
+        self.create_threshold_config(scrollable_frame)
+        self.create_blob_config(scrollable_frame)
+        self.create_tracking_config(scrollable_frame)
+        self.create_nose_config(scrollable_frame)
+        self.create_action_buttons(scrollable_frame)
+
+    def create_threshold_config(self, parent):
+        """Create threshold configuration section"""
+        threshold_frame = ttk.LabelFrame(parent, text="Threshold Parameters", padding="10")
+        threshold_frame.pack(fill='x', padx=5, pady=5)
+
+        # Min threshold
+        min_frame = ttk.Frame(threshold_frame)
+        min_frame.pack(fill='x', pady=2)
+        ttk.Label(min_frame, text="Minimum Threshold:").pack(side='left', anchor='w')
+        self.min_thresh_var = tk.StringVar(value=str(self.config.threshold_min))
+        min_thresh_entry = ttk.Entry(min_frame, textvariable=self.min_thresh_var, width=10)
+        min_thresh_entry.pack(side='right')
+        min_thresh_entry.bind('<KeyRelease>', self.validate_threshold_params)
+
+        # Max threshold
+        max_frame = ttk.Frame(threshold_frame)
+        max_frame.pack(fill='x', pady=2)
+        ttk.Label(max_frame, text="Maximum Threshold:").pack(side='left', anchor='w')
+        self.max_thresh_var = tk.StringVar(value=str(self.config.threshold_max))
+        max_thresh_entry = ttk.Entry(max_frame, textvariable=self.max_thresh_var, width=10)
+        max_thresh_entry.pack(side='right')
+        max_thresh_entry.bind('<KeyRelease>', self.validate_threshold_params)
+
+        # Info label
+        ttk.Label(threshold_frame, text="Range: 0-255. Higher values detect brighter objects.", 
+                 font=('TkDefaultFont', 8), foreground='gray').pack(anchor='w', pady=(5,0))
+
+    def create_blob_config(self, parent):
+        """Create blob size configuration section"""
+        blob_frame = ttk.LabelFrame(parent, text="Blob Size Filters", padding="10")
+        blob_frame.pack(fill='x', padx=5, pady=5)
+
+        # Min blob size
+        min_blob_frame = ttk.Frame(blob_frame)
+        min_blob_frame.pack(fill='x', pady=2)
+        ttk.Label(min_blob_frame, text="Minimum Blob Size (pixels):").pack(side='left', anchor='w')
+        self.min_blob_var = tk.StringVar(value=str(self.config.min_blob_size))
+        min_blob_entry = ttk.Entry(min_blob_frame, textvariable=self.min_blob_var, width=10)
+        min_blob_entry.pack(side='right')
+        min_blob_entry.bind('<KeyRelease>', self.validate_blob_params)
+
+        # Max blob size
+        max_blob_frame = ttk.Frame(blob_frame)
+        max_blob_frame.pack(fill='x', pady=2)
+        ttk.Label(max_blob_frame, text="Maximum Blob Size (pixels):").pack(side='left', anchor='w')
+        self.max_blob_var = tk.StringVar(value=str(self.config.max_blob_size))
+        max_blob_entry = ttk.Entry(max_blob_frame, textvariable=self.max_blob_var, width=10)
+        max_blob_entry.pack(side='right')
+        max_blob_entry.bind('<KeyRelease>', self.validate_blob_params)
+
+        # Info label
+        ttk.Label(blob_frame, text="Filters detected objects by area. Adjust for worm size.", 
+                 font=('TkDefaultFont', 8), foreground='gray').pack(anchor='w', pady=(5,0))
+
+    def create_tracking_config(self, parent):
+        """Create tracking configuration section"""
+        tracking_frame = ttk.LabelFrame(parent, text="Trajectory-Aware Tracking Parameters", padding="10")
+        tracking_frame.pack(fill='x', padx=5, pady=5)
+
+        # Max distance
+        max_dist_frame = ttk.Frame(tracking_frame)
+        max_dist_frame.pack(fill='x', pady=2)
+        ttk.Label(max_dist_frame, text="Max Distance Between Frames (pixels):").pack(side='left', anchor='w')
+        self.max_dist_var = tk.StringVar(value=str(self.config.max_distance))
+        max_dist_entry = ttk.Entry(max_dist_frame, textvariable=self.max_dist_var, width=10)
+        max_dist_entry.pack(side='right')
+        max_dist_entry.bind('<KeyRelease>', self.validate_tracking_params)
+
+        # Trajectory weight
+        traj_weight_frame = ttk.Frame(tracking_frame)
+        traj_weight_frame.pack(fill='x', pady=2)
+        ttk.Label(traj_weight_frame, text="Trajectory Weight (0.0-1.0):").pack(side='left', anchor='w')
+        self.traj_weight_var = tk.StringVar(value=str(self.config.trajectory_weight))
+        traj_weight_entry = ttk.Entry(traj_weight_frame, textvariable=self.traj_weight_var, width=10)
+        traj_weight_entry.pack(side='right')
+        traj_weight_entry.bind('<KeyRelease>', self.validate_tracking_params)
+
+        # Min track length
+        min_track_frame = ttk.Frame(tracking_frame)
+        min_track_frame.pack(fill='x', pady=2)
+        ttk.Label(min_track_frame, text="Minimum Track Length (frames):").pack(side='left', anchor='w')
+        self.min_track_var = tk.StringVar(value=str(self.config.min_track_length))
+        min_track_entry = ttk.Entry(min_track_frame, textvariable=self.min_track_var, width=10)
+        min_track_entry.pack(side='right')
+        min_track_entry.bind('<KeyRelease>', self.validate_tracking_params)
+
+        # Algorithm selection
+        algo_frame = ttk.Frame(tracking_frame)
+        algo_frame.pack(fill='x', pady=2)
+        ttk.Label(algo_frame, text="Assignment Algorithm:").pack(side='left', anchor='w')
+        self.algorithm_var = tk.StringVar(value="Greedy" if not self.config.use_hungarian else "Hungarian")
+        algo_combo = ttk.Combobox(algo_frame, textvariable=self.algorithm_var, 
+                                  values=["Greedy", "Hungarian"], width=12, state="readonly")
+        algo_combo.pack(side='right')
+        algo_combo.bind('<<ComboboxSelected>>', self.update_algorithm)
+
+        # Info labels
+        ttk.Label(tracking_frame, text="Trajectory weight: 0.7 recommended for ID swap prevention", 
+                 font=('TkDefaultFont', 8), foreground='gray').pack(anchor='w', pady=(5,0))
+        ttk.Label(tracking_frame, text="Greedy algorithm recommended for worm tracking", 
+                 font=('TkDefaultFont', 8), foreground='gray').pack(anchor='w')
+
+    def create_nose_config(self, parent):
+        """Create nose detection configuration section"""
+        nose_frame = ttk.LabelFrame(parent, text="Nose Detection Parameters", padding="10")
+        nose_frame.pack(fill='x', padx=5, pady=5)
+
+        # Enable/disable nose detection
+        nose_enable_frame = ttk.Frame(nose_frame)
+        nose_enable_frame.pack(fill='x', pady=2)
+        self.nose_enabled_var = tk.BooleanVar(value=self.config.nose_detection_enabled)
+        nose_check = ttk.Checkbutton(nose_enable_frame, text="Enable Nose Detection", 
+                                     variable=self.nose_enabled_var,
+                                     command=self.update_nose_detection)
+        nose_check.pack(side='left', anchor='w')
+
+        # Smoothing frames
+        smooth_frame = ttk.Frame(nose_frame)
+        smooth_frame.pack(fill='x', pady=2)
+        ttk.Label(smooth_frame, text="Smoothing Frames (2-10):").pack(side='left', anchor='w')
+        self.nose_smooth_var = tk.StringVar(value=str(self.config.nose_smoothing_frames))
+        smooth_entry = ttk.Entry(smooth_frame, textvariable=self.nose_smooth_var, width=10)
+        smooth_entry.pack(side='right')
+        smooth_entry.bind('<KeyRelease>', self.validate_nose_params)
+
+        # Min movement threshold
+        movement_frame = ttk.Frame(nose_frame)
+        movement_frame.pack(fill='x', pady=2)
+        ttk.Label(movement_frame, text="Min Movement Threshold (pixels/frame):").pack(side='left', anchor='w')
+        self.nose_movement_var = tk.StringVar(value=str(self.config.min_movement_threshold))
+        movement_entry = ttk.Entry(movement_frame, textvariable=self.nose_movement_var, width=10)
+        movement_entry.pack(side='right')
+        movement_entry.bind('<KeyRelease>', self.validate_nose_params)
+
+        # Info label
+        ttk.Label(nose_frame, text="Detects worm front based on locomotion direction", 
+                 font=('TkDefaultFont', 8), foreground='gray').pack(anchor='w', pady=(5,0))
+
+    def create_action_buttons(self, parent):
+        """Create action buttons for configuration"""
+        action_frame = ttk.Frame(parent, padding="10")
+        action_frame.pack(fill='x', padx=5, pady=10)
+
+        ttk.Button(action_frame, text="Reset to Defaults", command=self.reset_to_defaults).pack(side='left', padx=5)
+        ttk.Button(action_frame, text="Validate All Parameters", command=self.validate_all_parameters).pack(side='left', padx=5)
+        ttk.Button(action_frame, text="Save Configuration", command=self.save_configuration).pack(side='left', padx=5)
+        ttk.Button(action_frame, text="Load Configuration", command=self.load_configuration).pack(side='left', padx=5)
+
+        # Status label
+        self.config_status_label = ttk.Label(action_frame, text="Parameters valid", foreground='green')
+        self.config_status_label.pack(side='right', padx=10)
+
+    def create_batch_tab(self):
+        """Create the batch processing tab"""
+        batch_frame = ttk.Frame(self.batch_tab, padding="10")
+        batch_frame.pack(fill='both', expand=True)
+
+        batch_frame.columnconfigure(1, weight=1)
+        batch_frame.rowconfigure(2, weight=1)
+
+        # Configuration summary
+        summary_frame = ttk.LabelFrame(batch_frame, text="Current Configuration Summary", padding="10")
+        summary_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+
+        self.config_summary_text = tk.Text(summary_frame, height=6, wrap='word', font=('TkDefaultFont', 8))
+        self.config_summary_text.pack(fill='x')
+        self.update_config_summary()
 
         # Directory selection section
-        dir_frame = ttk.LabelFrame(main_frame, text="Directory Selection", padding="10")
+        dir_frame = ttk.LabelFrame(batch_frame, text="Directory Selection", padding="10")
         dir_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
 
         buttons_frame = ttk.Frame(dir_frame)
@@ -703,7 +910,7 @@ class BatchWormTrackerGUI:
         dir_scrollbar.pack(side='right', fill='y')
 
         # Progress section
-        progress_frame = ttk.LabelFrame(main_frame, text="Processing Progress", padding="10")
+        progress_frame = ttk.LabelFrame(batch_frame, text="Processing Progress", padding="10")
         progress_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
 
         # Progress bars
@@ -722,24 +929,274 @@ class BatchWormTrackerGUI:
         self.current_dir_label = ttk.Label(progress_frame, text="")
         self.current_dir_label.pack(anchor='w')
 
-        # Results section
-        results_frame = ttk.LabelFrame(main_frame, text="Processing Results", padding="10")
-        results_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S))
+    def create_results_tab(self):
+        """Create the results tab"""
+        results_frame = ttk.Frame(self.results_tab, padding="10")
+        results_frame.pack(fill='both', expand=True)
 
-        main_frame.rowconfigure(3, weight=2)  # Give more space to results
+        results_frame.columnconfigure(0, weight=1)
+        results_frame.rowconfigure(1, weight=1)
+
+        # Results summary
+        summary_frame = ttk.LabelFrame(results_frame, text="Processing Summary", padding="10")
+        summary_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+
+        self.results_summary_label = ttk.Label(summary_frame, text="No processing results yet")
+        self.results_summary_label.pack(anchor='w')
 
         # Results text area
-        self.results_text = scrolledtext.ScrolledText(results_frame, height=15, wrap='word')
+        results_text_frame = ttk.LabelFrame(results_frame, text="Detailed Results", padding="10")
+        results_text_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        self.results_text = scrolledtext.ScrolledText(results_text_frame, height=20, wrap='word')
         self.results_text.pack(fill='both', expand=True)
 
         # Bottom buttons
-        button_frame = ttk.Frame(main_frame)
-        button_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(10, 0))
+        button_frame = ttk.Frame(results_frame)
+        button_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(10, 0))
 
         ttk.Button(button_frame, text="Export Summary Report", command=self.export_summary).pack(side='left')
         ttk.Button(button_frame, text="Clear Results", command=self.clear_results).pack(side='left', padx=(10, 0))
         ttk.Button(button_frame, text="Exit", command=self.root.quit).pack(side='right')
 
+    # Parameter validation methods
+    def validate_threshold_params(self, event=None):
+        """Validate threshold parameters"""
+        try:
+            min_val = int(self.min_thresh_var.get())
+            max_val = int(self.max_thresh_var.get())
+            
+            if not (0 <= min_val <= 255) or not (0 <= max_val <= 255) or min_val >= max_val:
+                self.config_status_label.config(text="Invalid threshold range", foreground='red')
+                return False
+            
+            self.config.threshold_min = min_val
+            self.config.threshold_max = max_val
+            self.update_config_summary()
+            return True
+        except ValueError:
+            self.config_status_label.config(text="Invalid threshold values", foreground='red')
+            return False
+
+    def validate_blob_params(self, event=None):
+        """Validate blob size parameters"""
+        try:
+            min_val = int(self.min_blob_var.get())
+            max_val = int(self.max_blob_var.get())
+            
+            if min_val < 1 or max_val < min_val:
+                self.config_status_label.config(text="Invalid blob size range", foreground='red')
+                return False
+            
+            self.config.min_blob_size = min_val
+            self.config.max_blob_size = max_val
+            self.update_config_summary()
+            return True
+        except ValueError:
+            self.config_status_label.config(text="Invalid blob size values", foreground='red')
+            return False
+
+    def validate_tracking_params(self, event=None):
+        """Validate tracking parameters"""
+        try:
+            max_dist = int(self.max_dist_var.get())
+            traj_weight = float(self.traj_weight_var.get())
+            min_track = int(self.min_track_var.get())
+            
+            if max_dist < 1 or not (0.0 <= traj_weight <= 1.0) or min_track < 1:
+                self.config_status_label.config(text="Invalid tracking parameters", foreground='red')
+                return False
+            
+            self.config.max_distance = max_dist
+            self.config.trajectory_weight = traj_weight
+            self.config.min_track_length = min_track
+            self.update_config_summary()
+            return True
+        except ValueError:
+            self.config_status_label.config(text="Invalid tracking values", foreground='red')
+            return False
+
+    def validate_nose_params(self, event=None):
+        """Validate nose detection parameters"""
+        try:
+            smooth_frames = int(self.nose_smooth_var.get())
+            min_movement = float(self.nose_movement_var.get())
+            
+            if not (2 <= smooth_frames <= 10) or min_movement < 0.1:
+                self.config_status_label.config(text="Invalid nose parameters", foreground='red')
+                return False
+            
+            self.config.nose_smoothing_frames = smooth_frames
+            self.config.min_movement_threshold = min_movement
+            self.update_config_summary()
+            return True
+        except ValueError:
+            self.config_status_label.config(text="Invalid nose values", foreground='red')
+            return False
+
+    def update_algorithm(self, event=None):
+        """Update algorithm selection"""
+        self.config.use_hungarian = (self.algorithm_var.get() == "Hungarian")
+        self.update_config_summary()
+
+    def update_nose_detection(self):
+        """Update nose detection enabled state"""
+        self.config.nose_detection_enabled = self.nose_enabled_var.get()
+        self.update_config_summary()
+
+    def validate_all_parameters(self):
+        """Validate all parameters"""
+        valid = (self.validate_threshold_params() and 
+                self.validate_blob_params() and 
+                self.validate_tracking_params() and 
+                self.validate_nose_params())
+        
+        if valid:
+            self.config_status_label.config(text="All parameters valid", foreground='green')
+            # Update tracker with new config
+            self.tracker = BatchWormTracker(self.config)
+        
+        return valid
+
+    def reset_to_defaults(self):
+        """Reset all parameters to defaults"""
+        self.config = BatchConfig()
+        
+        # Update GUI elements
+        self.min_thresh_var.set(str(self.config.threshold_min))
+        self.max_thresh_var.set(str(self.config.threshold_max))
+        self.min_blob_var.set(str(self.config.min_blob_size))
+        self.max_blob_var.set(str(self.config.max_blob_size))
+        self.max_dist_var.set(str(self.config.max_distance))
+        self.traj_weight_var.set(str(self.config.trajectory_weight))
+        self.min_track_var.set(str(self.config.min_track_length))
+        self.algorithm_var.set("Greedy" if not self.config.use_hungarian else "Hungarian")
+        self.nose_enabled_var.set(self.config.nose_detection_enabled)
+        self.nose_smooth_var.set(str(self.config.nose_smoothing_frames))
+        self.nose_movement_var.set(str(self.config.min_movement_threshold))
+        
+        self.config_status_label.config(text="Reset to defaults", foreground='green')
+        self.tracker = BatchWormTracker(self.config)
+        self.update_config_summary()
+
+    def update_config_summary(self):
+        """Update the configuration summary display"""
+        summary = f"Thresholds: {self.config.threshold_min}-{self.config.threshold_max} | "
+        summary += f"Blob Size: {self.config.min_blob_size}-{self.config.max_blob_size} px | "
+        summary += f"Max Distance: {self.config.max_distance} px | "
+        summary += f"Trajectory Weight: {self.config.trajectory_weight} | "
+        summary += f"Min Track: {self.config.min_track_length} frames | "
+        summary += f"Algorithm: {'Hungarian' if self.config.use_hungarian else 'Greedy'} | "
+        summary += f"Nose Detection: {'ON' if self.config.nose_detection_enabled else 'OFF'}"
+        
+        if hasattr(self, 'config_summary_text'):
+            self.config_summary_text.delete(1.0, tk.END)
+            self.config_summary_text.insert(1.0, summary)
+
+    def save_configuration(self):
+        """Save current configuration to file"""
+        if not self.validate_all_parameters():
+            messagebox.showerror("Invalid Parameters", "Please fix parameter errors before saving")
+            return
+            
+        file_path = filedialog.asksaveasfilename(
+            title="Save Configuration",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        
+        if not file_path:
+            return
+            
+        try:
+            with open(file_path, 'w') as f:
+                f.write("# Enhanced Batch Worm Tracker Configuration\n")
+                f.write(f"threshold_min={self.config.threshold_min}\n")
+                f.write(f"threshold_max={self.config.threshold_max}\n")
+                f.write(f"min_blob_size={self.config.min_blob_size}\n")
+                f.write(f"max_blob_size={self.config.max_blob_size}\n")
+                f.write(f"max_distance={self.config.max_distance}\n")
+                f.write(f"trajectory_weight={self.config.trajectory_weight}\n")
+                f.write(f"min_track_length={self.config.min_track_length}\n")
+                f.write(f"use_hungarian={self.config.use_hungarian}\n")
+                f.write(f"nose_detection_enabled={self.config.nose_detection_enabled}\n")
+                f.write(f"nose_smoothing_frames={self.config.nose_smoothing_frames}\n")
+                f.write(f"min_movement_threshold={self.config.min_movement_threshold}\n")
+            
+            messagebox.showinfo("Configuration Saved", f"Configuration saved to:\n{file_path}")
+        except Exception as e:
+            messagebox.showerror("Save Error", f"Failed to save configuration:\n{e}")
+
+    def load_configuration(self):
+        """Load configuration from file"""
+        file_path = filedialog.askopenfilename(
+            title="Load Configuration",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        
+        if not file_path:
+            return
+            
+        try:
+            with open(file_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith('#') or not line:
+                        continue
+                    
+                    if '=' in line:
+                        key, value = line.split('=', 1)
+                        key = key.strip()
+                        value = value.strip()
+                        
+                        try:
+                            if key == 'threshold_min':
+                                self.config.threshold_min = int(value)
+                                self.min_thresh_var.set(value)
+                            elif key == 'threshold_max':
+                                self.config.threshold_max = int(value)
+                                self.max_thresh_var.set(value)
+                            elif key == 'min_blob_size':
+                                self.config.min_blob_size = int(value)
+                                self.min_blob_var.set(value)
+                            elif key == 'max_blob_size':
+                                self.config.max_blob_size = int(value)
+                                self.max_blob_var.set(value)
+                            elif key == 'max_distance':
+                                self.config.max_distance = int(value)
+                                self.max_dist_var.set(value)
+                            elif key == 'trajectory_weight':
+                                self.config.trajectory_weight = float(value)
+                                self.traj_weight_var.set(value)
+                            elif key == 'min_track_length':
+                                self.config.min_track_length = int(value)
+                                self.min_track_var.set(value)
+                            elif key == 'use_hungarian':
+                                self.config.use_hungarian = value.lower() == 'true'
+                                self.algorithm_var.set("Hungarian" if self.config.use_hungarian else "Greedy")
+                            elif key == 'nose_detection_enabled':
+                                self.config.nose_detection_enabled = value.lower() == 'true'
+                                self.nose_enabled_var.set(self.config.nose_detection_enabled)
+                            elif key == 'nose_smoothing_frames':
+                                self.config.nose_smoothing_frames = int(value)
+                                self.nose_smooth_var.set(value)
+                            elif key == 'min_movement_threshold':
+                                self.config.min_movement_threshold = float(value)
+                                self.nose_movement_var.set(value)
+                        except ValueError:
+                            continue
+            
+            if self.validate_all_parameters():
+                self.tracker = BatchWormTracker(self.config)
+                self.update_config_summary()
+                messagebox.showinfo("Configuration Loaded", "Configuration loaded successfully")
+            else:
+                messagebox.showwarning("Invalid Configuration", "Some parameters in the file are invalid")
+                
+        except Exception as e:
+            messagebox.showerror("Load Error", f"Failed to load configuration:\n{e}")
+
+    # Batch processing methods (same as before but using self.config)
     def add_directory(self):
         """Add a directory to the processing list"""
         directory = filedialog.askdirectory(title="Select directory containing images")
@@ -774,7 +1231,11 @@ class BatchWormTrackerGUI:
         self.root.update_idletasks()
 
     def start_batch_processing(self):
-        """Start batch processing in a separate thread"""
+        """Start batch processing with current configuration"""
+        if not self.validate_all_parameters():
+            messagebox.showerror("Invalid Parameters", "Please fix parameter errors before processing")
+            return
+            
         if not self.directories:
             messagebox.showwarning("No Directories", "Please add at least one directory to process")
             return
@@ -783,12 +1244,15 @@ class BatchWormTrackerGUI:
             messagebox.showwarning("Processing Active", "Batch processing is already running")
             return
 
+        # Update tracker with current config
+        self.tracker = BatchWormTracker(self.config)
+
         # Confirm processing
         num_dirs = len(self.directories)
-        confirm_msg = f"Start processing {num_dirs} directories?\n\n"
+        confirm_msg = f"Start processing {num_dirs} directories with current configuration?\n\n"
         confirm_msg += "This will:\n"
         confirm_msg += "• Generate background images for each directory\n"
-        confirm_msg += "• Run trajectory-aware tracking with nose detection\n"
+        confirm_msg += "• Run trajectory-aware tracking with current parameters\n"
         confirm_msg += "• Save tracks.csv to each directory (overwriting existing files)\n"
         confirm_msg += "• Flag directories with quality issues\n\n"
         confirm_msg += "This process may take several minutes per directory."
@@ -844,6 +1308,17 @@ class BatchWormTrackerGUI:
         """Update results display with new result"""
         self.results_text.insert(tk.END, self._format_result(result))
         self.results_text.see(tk.END)
+        self._update_results_summary()
+
+    def _update_results_summary(self):
+        """Update the results summary label"""
+        if not self.results:
+            return
+            
+        successful = len([r for r in self.results if r.success])
+        total = len(self.results)
+        summary = f"Processed: {total} directories | Successful: {successful} | Failed: {total - successful}"
+        self.results_summary_label.config(text=summary)
 
     def _format_result(self, result: ProcessingResult) -> str:
         """Format a single result for display"""
@@ -878,8 +1353,11 @@ class BatchWormTrackerGUI:
         self.results_text.insert(tk.END, summary)
         self.results_text.see(tk.END)
 
+        # Switch to results tab
+        self.notebook.select(self.results_tab)
+
         # Show completion dialog
-        messagebox.showinfo("Batch Complete", "Batch processing finished!\n\nCheck the results below for quality flags and any errors.")
+        messagebox.showinfo("Batch Complete", "Batch processing finished!\n\nCheck the Results tab for detailed information.")
 
     def _generate_summary(self) -> str:
         """Generate summary of batch processing results"""
@@ -901,30 +1379,46 @@ class BatchWormTrackerGUI:
             total_time = sum(r.processing_time for r in successful)
             avg_time = total_time / len(successful)
 
-            summary += f"Normal quality: {len(normal_quality)}\n"
-            summary += f"Noisy (needs QC): {len(noisy_quality)}\n"
-            summary += f"Empty (no tracks): {len(empty_quality)}\n\n"
+            summary += f"Quality Assessment:\n"
+            summary += f"  Normal quality: {len(normal_quality)}\n"
+            summary += f"  Noisy (needs QC): {len(noisy_quality)}\n"
+            summary += f"  Empty (no tracks): {len(empty_quality)}\n\n"
 
-            summary += f"Total tracks generated: {total_tracks}\n"
-            summary += f"Average processing time: {avg_time:.1f}s per directory\n"
-            summary += f"Total processing time: {total_time:.1f}s\n\n"
+            summary += f"Performance:\n"
+            summary += f"  Total tracks generated: {total_tracks}\n"
+            summary += f"  Average processing time: {avg_time:.1f}s per directory\n"
+            summary += f"  Total processing time: {total_time:.1f}s\n\n"
+
+        # Configuration used
+        summary += f"Configuration Used:\n"
+        summary += f"  Thresholds: {self.config.threshold_min}-{self.config.threshold_max}\n"
+        summary += f"  Blob Size: {self.config.min_blob_size}-{self.config.max_blob_size} pixels\n"
+        summary += f"  Max Distance: {self.config.max_distance} px\n"
+        summary += f"  Trajectory Weight: {self.config.trajectory_weight}\n"
+        summary += f"  Min Track Length: {self.config.min_track_length} frames\n"
+        summary += f"  Algorithm: {'Hungarian' if self.config.use_hungarian else 'Greedy'}\n"
+        summary += f"  Nose Detection: {'Enabled' if self.config.nose_detection_enabled else 'Disabled'}\n"
+        if self.config.nose_detection_enabled:
+            summary += f"  Nose Smoothing: {self.config.nose_smoothing_frames} frames\n"
+            summary += f"  Movement Threshold: {self.config.min_movement_threshold} px/frame\n"
+        summary += "\n"
 
         if noisy_quality:
             summary += "DIRECTORIES NEEDING MANUAL QC (High track count):\n"
             for result in noisy_quality:
-                summary += f"   • {os.path.basename(result.directory)} ({result.num_accepted_tracks} tracks)\n"
+                summary += f"  • {os.path.basename(result.directory)} ({result.num_accepted_tracks} tracks)\n"
             summary += "\n"
 
         if empty_quality:
             summary += "DIRECTORIES WITH NO TRACKS FOUND:\n"
             for result in empty_quality:
-                summary += f"   • {os.path.basename(result.directory)}\n"
+                summary += f"  • {os.path.basename(result.directory)}\n"
             summary += "\n"
 
         if failed:
             summary += "FAILED DIRECTORIES:\n"
             for result in failed:
-                summary += f"   • {os.path.basename(result.directory)}: {result.error_message}\n"
+                summary += f"  • {os.path.basename(result.directory)}: {result.error_message}\n"
             summary += "\n"
 
         summary += "All tracks.csv files have been saved to their respective directories.\n"
@@ -948,8 +1442,8 @@ class BatchWormTrackerGUI:
 
         try:
             with open(file_path, 'w') as f:
-                f.write("BATCH WORM TRACKER PROCESSING REPORT\n")
-                f.write("=" * 50 + "\n")
+                f.write("ENHANCED BATCH WORM TRACKER PROCESSING REPORT\n")
+                f.write("=" * 60 + "\n")
                 f.write(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 
                 # Configuration
@@ -959,12 +1453,16 @@ class BatchWormTrackerGUI:
                 f.write(f"Max Distance: {self.config.max_distance} px\n")
                 f.write(f"Trajectory Weight: {self.config.trajectory_weight}\n")
                 f.write(f"Min Track Length: {self.config.min_track_length} frames\n")
+                f.write(f"Algorithm: {'Hungarian' if self.config.use_hungarian else 'Greedy'}\n")
                 f.write(f"Nose Detection: {'Enabled' if self.config.nose_detection_enabled else 'Disabled'}\n")
-                f.write(f"Algorithm: {'Hungarian' if self.config.use_hungarian else 'Greedy'}\n\n")
+                if self.config.nose_detection_enabled:
+                    f.write(f"Nose Smoothing Frames: {self.config.nose_smoothing_frames}\n")
+                    f.write(f"Min Movement Threshold: {self.config.min_movement_threshold}\n")
+                f.write("\n")
 
                 # Detailed results
                 f.write("DETAILED RESULTS:\n")
-                f.write("-" * 30 + "\n")
+                f.write("-" * 40 + "\n")
                 for result in self.results:
                     f.write(f"Directory: {result.directory}\n")
                     f.write(f"Success: {result.success}\n")
@@ -975,7 +1473,7 @@ class BatchWormTrackerGUI:
                     f.write(f"Processing Time: {result.processing_time:.1f}s\n")
                     if result.error_message:
                         f.write(f"Error: {result.error_message}\n")
-                    f.write("-" * 30 + "\n")
+                    f.write("-" * 40 + "\n")
 
                 # Summary
                 f.write("\n" + self._generate_summary())
@@ -993,6 +1491,7 @@ class BatchWormTrackerGUI:
         self.current_progress.config(value=0)
         self.update_status("Results cleared")
         self.update_current_dir_status("")
+        self.results_summary_label.config(text="No processing results yet")
 
     def run(self):
         """Run the GUI application"""
@@ -1000,29 +1499,41 @@ class BatchWormTrackerGUI:
 
 
 def main():
-    """Main function to run the batch tracker"""
-    print("=" * 60)
-    print("BATCH WORM TRACKER")
-    print("Automated processing of multiple image directories")
-    print("=" * 60)
+    """Main function to run the enhanced batch tracker"""
+    print("=" * 70)
+    print("ENHANCED BATCH WORM TRACKER")
+    print("Automated processing with adjustable parameters")
+    print("=" * 70)
+    print("\nNEW FEATURES:")
+    print("• Full parameter customization with validation")
+    print("• Tabbed interface for better organization")
+    print("• Save/load configuration files")
+    print("• Real-time parameter validation")
+    print("• Enhanced results summary")
+    print("• Same core tracking as main tracker")
     print("\nFEATURES:")
-    print("• Uses same settings as main tracker (trajectory-aware + nose detection)")
-    print("• Processes multiple directories automatically")
-    print("• Saves tracks.csv to each directory (overwrites existing)")
+    print("• Trajectory-aware tracking with configurable weight")
+    print("• Adjustable thresholding and blob filtering")
+    print("• Nose detection with configurable parameters")
     print("• Quality assessment (flags noisy/empty results)")
-    print("• Comprehensive summary report")
+    print("• Comprehensive summary reports")
     print("• Network drive compatible")
     print("\nQUALITY FLAGS:")
     print("NORMAL: Standard number of tracks detected")
     print("NOISY: High track count - manual QC recommended")
     print("EMPTY: No tracks found - check parameters")
-    print("\nSTARTING BATCH TRACKER GUI...")
+    print("\nWORKFLOW:")
+    print("1. Configure parameters in the Configuration tab")
+    print("2. Add directories in the Batch Processing tab")
+    print("3. Start processing and monitor progress")
+    print("4. Review results in the Results tab")
+    print("\nSTARTING ENHANCED BATCH TRACKER GUI...")
 
     try:
         app = BatchWormTrackerGUI()
         app.run()
     except Exception as e:
-        print(f"Error starting batch tracker: {e}")
+        print(f"Error starting enhanced batch tracker: {e}")
         import traceback
         traceback.print_exc()
 
