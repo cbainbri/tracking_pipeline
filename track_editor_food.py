@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-ULTRA-OPTIMIZED TRACK EDITOR - Production Ready Version with Nose Coordinate Support
-Complete refactoring with improved architecture while preserving all functionality
+SWT Track Editor
+
 """
 
 import cv2
@@ -617,6 +617,51 @@ class TrackManager:
             return True
         
         return False
+
+    def get_next_track_id(self) -> int:
+        """Return the next available integer track id."""
+        if not self.tracks:
+            return 0
+        # Avoid deleted ids; we only need a unique new id.
+        return max(self.tracks.keys()) + 1
+
+    def split_track(self, track_id: int, split_frame: int) -> Optional[int]:
+        """
+        Split a single track into two at the given split_frame.
+        Left side keeps frames <= split_frame under the same id.
+        Right side (frames > split_frame) becomes a NEW track id and is returned.
+        Returns None if nothing to split (e.g., no points after split_frame) or invalid id.
+        """
+        if track_id not in self.tracks or track_id in self.deleted_tracks:
+            return None
+
+        positions = self.tracks[track_id]
+        if not positions:
+            return None
+
+        left = [p for p in positions if p.frame <= split_frame]
+        right = [p for p in positions if p.frame > split_frame]
+
+        # Nothing on the right -> no split needed
+        if not right:
+            return None
+
+        # Keep left under same id; create a new id for the right part
+        new_id = self.get_next_track_id()
+        # Preserve order
+        left.sort(key=lambda p: p.frame)
+        right.sort(key=lambda p: p.frame)
+
+        self.tracks[track_id] = left
+        self.tracks[new_id] = right
+
+        # Keep book-keeping consistent with original states
+        if track_id in self.deleted_tracks:
+            self.deleted_tracks.discard(track_id)
+        if new_id in self.deleted_tracks:
+            self.deleted_tracks.discard(new_id)
+
+        return new_id
     
     def save_to_csv(self, file_path: str) -> bool:
         """Save tracks to CSV with nose coordinates if available"""
@@ -781,7 +826,7 @@ class UltraOptimizedTrackEditor:
     def setup_gui(self):
         """Initialize GUI"""
         self.root = tk.Tk()
-        self.root.title("Ultra-Optimized Track Editor - Production Ready")
+        self.root.title("SWT Track Editor")
         self.root.geometry("1600x1000")
         self.root.minsize(1400, 800)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -791,7 +836,12 @@ class UltraOptimizedTrackEditor:
         plt.rcParams['axes.facecolor'] = 'black'
         
         self.create_interface()
-    
+
+        try:
+            self.root.bind('<s>', lambda e: self.split_selected_track())
+            self.root.bind('<S>', lambda e: self.split_selected_track())
+        except Exception:
+            pass    
     def create_interface(self):
         """Create complete interface"""
         # Top controls
@@ -957,6 +1007,9 @@ class UltraOptimizedTrackEditor:
                                       command=self.merge_selected_tracks, state='disabled')
         self.merge_button.pack(side='left', padx=2)
         
+        self.split_button = ttk.Button(action_frame, text="Split @ Frame",
+                                       command=self.split_selected_track, state='disabled')
+        self.split_button.pack(side='left', padx=2)
         self.save_edits_button = ttk.Button(action_frame, text="Save Edits",
                                            command=self.save_edited_tracks, state='disabled')
         self.save_edits_button.pack(side='left', padx=2)
@@ -1165,7 +1218,7 @@ class UltraOptimizedTrackEditor:
         if self.track_manager.tracks:
             self._draw_tracks_on_axis()
         
-        title = f"Ultra-Optimized Track Editor - Frame {self.current_frame}"
+        title = f"SWT Track Editor - Frame {self.current_frame}"
         if self.use_nose_coordinates:
             title += " (Nose Coordinates)"
         
@@ -1575,7 +1628,7 @@ class UltraOptimizedTrackEditor:
             
             for btn in [self.selection_button, self.clear_selection_button,
                        self.delete_button, self.keep_button, self.merge_button,
-                       self.save_edits_button]:
+                       self.split_button,self.save_edits_button]:
                 btn.config(state='normal')
         else:
             self.selection_mode = False
@@ -1583,7 +1636,7 @@ class UltraOptimizedTrackEditor:
             
             for btn in [self.selection_button, self.clear_selection_button,
                        self.delete_button, self.keep_button, self.merge_button,
-                       self.save_edits_button]:
+                       self.split_button,self.save_edits_button]:
                 btn.config(state='disabled')
             
             self.selection_button.config(text="Select Tracks")
@@ -1659,6 +1712,13 @@ class UltraOptimizedTrackEditor:
                 text=f"Selected: {selected_list[:5]}{'...' if len(selected_list) > 5 else ''} ({len(selected_list)} tracks)")
         else:
             self.selected_tracks_label.config(text="Selected: None")
+
+        # Enable split only when editing is on and exactly one track is selected
+        if hasattr(self, "split_button"):
+            if self.editing_enabled and len(self.selected_tracks) == 1:
+                self.split_button.config(state='normal')
+            else:
+                self.split_button.config(state='disabled')
     
     def delete_selected_tracks(self):
         """Delete selected tracks"""
@@ -1713,7 +1773,28 @@ class UltraOptimizedTrackEditor:
                 self.selected_tracks.clear()
                 self.update_selection_display()
                 self.update_frame_display(force_update=True)
-    
+
+    def split_selected_track(self):
+        """Split the single selected track at the current frame into two tracks."""
+        # Guardrails
+        if not self.selected_tracks or len(self.selected_tracks) != 1:
+            messagebox.showwarning("Split", "Select exactly one track to split.")
+            return
+
+        track_id = next(iter(self.selected_tracks))
+
+        # Perform split in the data model
+        new_id = self.track_manager.split_track(track_id, self.current_frame)
+        if new_id is None:
+            messagebox.showinfo("Split", "Nothing to split at this frame (no future positions).")
+            return
+
+        # Make the effect clear — keep both parts selected
+        self.selected_tracks = {track_id, new_id}
+
+        # Refresh UI
+        self.update_selection_display()
+        self.update_frame_display(force_update=True)    
     def save_edited_tracks(self):
         """Save edited tracks"""
         if not self.track_manager.tracks:
@@ -1842,7 +1923,7 @@ System:
     
     def on_closing(self):
         """Clean shutdown"""
-        logger.info("Shutting down track editor...")
+        logger.info("Shutting down SWT Track Editor...")
         
         self.playing = False
         
@@ -1866,7 +1947,7 @@ System:
     def run(self):
         """Start the application"""
         try:
-            logger.info("Starting Ultra-Optimized Track Editor...")
+            logger.info("Starting SWT Track Editor...")
             self.root.mainloop()
         except KeyboardInterrupt:
             self.on_closing()
@@ -1879,7 +1960,7 @@ System:
 
 def main():
     """Main entry point with command line support"""
-    parser = argparse.ArgumentParser(description="Ultra-Optimized Track Editor - Production Ready")
+    parser = argparse.ArgumentParser(description="SWT Track Editor")
     parser.add_argument("--csv", help="Path to track CSV to auto-load")
     parser.add_argument("--images", help="Path to image directory to auto-load")
     parser.add_argument("--cache-size", type=int, help="Override cache size")
@@ -1890,7 +1971,7 @@ def main():
     # Configure logging level
     logging.getLogger().setLevel(getattr(logging, args.log_level))
     
-    logger.info("=== ULTRA-OPTIMIZED TRACK EDITOR - Production Ready ===")
+    logger.info("=== SWT Track Editor - Production Ready ===")
     logger.info("Architecture Improvements:")
     logger.info("✓ Modular design with separated concerns")
     logger.info("✓ Protocol-based image loading with fallbacks")
