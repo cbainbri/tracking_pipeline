@@ -4,7 +4,8 @@
 """
 Enhanced Batch Worm Tracker - Automated processing with adjustable parameters
 Extracts core functionality from the main WormTracker for automated processing
-Now includes GUI controls for all tracking parameters
+Now includes GUI controls for all tracking parameters and stationary track filtering
+WITH SMART MULTIPLE DIRECTORY SELECTION SUPPORT
 """
 
 import os
@@ -39,6 +40,8 @@ class BatchConfig:
     nose_detection_enabled: bool = True
     nose_smoothing_frames: int = 2
     min_movement_threshold: float = 2.0
+    filter_stationary_tracks: bool = True
+    min_displacement_distance: float = 75.0
 
 
 @dataclass
@@ -410,6 +413,17 @@ class BatchWormTracker:
         nose_position = self.find_nose_position(contour, locomotion_direction)
         return nose_position
 
+    def calculate_track_displacement(self, track_positions: List[Tuple[float, float, int]]) -> float:
+        """Calculate total displacement from first to last position in a track"""
+        if len(track_positions) < 2:
+            return 0.0
+
+        first_pos = track_positions[0]
+        last_pos = track_positions[-1]
+
+        displacement = np.sqrt((last_pos[0] - first_pos[0])**2 + (last_pos[1] - first_pos[1])**2)
+        return displacement
+
     def process_directory(self, image_directory: str, progress_callback=None) -> ProcessingResult:
         """Process a single image directory"""
         start_time = time.time()
@@ -485,10 +499,12 @@ class BatchWormTracker:
         return "normal"
 
     def _run_tracking(self, image_files: List[str], background: np.ndarray, progress_callback=None) -> Tuple[Dict, Dict, List]:
-        """Run the tracking algorithm"""
+        """Run the tracking algorithm with proper track ID management"""
+        # FIXED: Reset everything for each directory (like main tracker does for each session)
         next_track_id = 1
         active_tracks = {}
         inactive_tracks = {}
+        used_track_ids = set()  # NEW: Track all IDs that have ever been used
         MAX_MISSING_FRAMES = 5
 
         total_frames = len(image_files)
@@ -517,7 +533,7 @@ class BatchWormTracker:
                             centroids.append((cx, cy))
                             valid_contours.append(contour)
 
-                # Deactivate old tracks
+                # FIXED: Deactivate old tracks (same as main tracker)
                 tracks_to_deactivate = []
                 for track_id, track_data in active_tracks.items():
                     frames_missing = frame_idx - track_data['last_frame']
@@ -527,6 +543,7 @@ class BatchWormTracker:
                 for track_id in tracks_to_deactivate:
                     inactive_tracks[track_id] = active_tracks[track_id]
                     del active_tracks[track_id]
+                    # CRITICAL: Do NOT remove from used_track_ids - keep it reserved forever
 
                 # Assign tracks
                 assignments = self.assign_tracks_with_trajectory(active_tracks, centroids)
@@ -550,9 +567,16 @@ class BatchWormTracker:
 
                     assigned_centroids.add(centroid_idx)
 
-                # Start new tracks
+                # FIXED: Start new tracks with guaranteed unique IDs
                 for i, (cx, cy) in enumerate(centroids):
                     if i not in assigned_centroids:
+                        # CRITICAL: Ensure this ID has never been used before
+                        while next_track_id in used_track_ids:
+                            next_track_id += 1
+
+                        # Mark this ID as used
+                        used_track_ids.add(next_track_id)
+
                         active_tracks[next_track_id] = {
                             'positions': [(cx, cy, frame_idx)],
                             'nose_positions': [],
@@ -564,33 +588,55 @@ class BatchWormTracker:
                 self.logger.warning(f"Error processing frame {frame_idx}: {e}")
                 continue
 
-        # Finalize tracks
+        # FIXED: Same finalization as main tracker - no track ID conflicts possible
         all_final_tracks = {**active_tracks, **inactive_tracks}
         tracks = {}
         nose_tracks = {}
         track_statistics = []
 
-        for track_id, track_data in all_final_tracks.items():
+        # Sort tracks by their original creation order (lowest ID first)
+        sorted_track_ids = sorted(all_final_tracks.keys())
+
+        # Renumber tracks starting from 1 for accepted tracks only
+        new_track_id = 1
+
+        for original_track_id in sorted_track_ids:
+            track_data = all_final_tracks[original_track_id]
             positions = track_data['positions']
             nose_positions = track_data.get('nose_positions', [])
             track_length = len(positions)
 
+            # Calculate displacement distance
+            displacement = self.calculate_track_displacement(positions)
+
             track_stats = {
-                'track_id': track_id,
+                'original_track_id': original_track_id,
                 'track_length': track_length,
+                'displacement_distance': round(displacement, 2),
                 'nose_detections': len(nose_positions),
                 'nose_success_rate': len(nose_positions) / track_length if track_length > 0 else 0,
                 'passed_length_filter': track_length >= self.config.min_track_length,
+                'passed_movement_filter': not self.config.filter_stationary_tracks or displacement >= self.config.min_displacement_distance,
                 'final_status': 'pending'
             }
 
+            # Apply filters
             if track_length < self.config.min_track_length:
                 track_stats['final_status'] = 'rejected_short'
+                track_stats['final_track_id'] = None
+            elif self.config.filter_stationary_tracks and displacement < self.config.min_displacement_distance:
+                track_stats['final_status'] = 'rejected_stationary'
+                track_stats['final_track_id'] = None
             else:
                 track_stats['final_status'] = 'accepted'
-                tracks[track_id] = positions
+                track_stats['final_track_id'] = new_track_id
+
+                # Use the new sequential track ID
+                tracks[new_track_id] = positions
                 if nose_positions:
-                    nose_tracks[track_id] = nose_positions
+                    nose_tracks[new_track_id] = nose_positions
+
+                new_track_id += 1
 
             track_statistics.append(track_stats)
 
@@ -636,6 +682,183 @@ class BatchWormTracker:
 
         df.to_csv(csv_path, index=False)
         self.logger.info(f"Exported tracks to {csv_path}")
+
+
+class SmartDirectoryDialog:
+    """Smart dialog for selecting single or multiple directories"""
+
+    def __init__(self, parent):
+        self.parent = parent
+        self.selected_directories = []
+        self.result = None
+
+    def show(self):
+        """Show the smart directory selection dialog"""
+        self.dialog = tk.Toplevel(self.parent)
+        self.dialog.title("Add Directories")
+        self.dialog.geometry("800x600")
+        self.dialog.transient(self.parent)
+        self.dialog.grab_set()
+
+        # Center the dialog
+        self.dialog.update_idletasks()
+        x = (self.dialog.winfo_screenwidth() // 2) - (800 // 2)
+        y = (self.dialog.winfo_screenheight() // 2) - (600 // 2)
+        self.dialog.geometry(f"800x600+{x}+{y}")
+
+        self.create_widgets()
+
+        # Wait for dialog to close
+        self.dialog.wait_window()
+        return self.result
+
+    def create_widgets(self):
+        """Create the dialog widgets"""
+        main_frame = ttk.Frame(self.dialog, padding="10")
+        main_frame.pack(fill='both', expand=True)
+
+        # Title
+        title_label = ttk.Label(main_frame, text="Add Directories for Batch Processing",
+                               font=('TkDefaultFont', 12, 'bold'))
+        title_label.pack(pady=(0, 10))
+
+        # Instructions
+        instructions = ("• Click 'Browse & Add Directory' to add individual directories\n"
+                       "• Click 'Add All Subdirectories' to add all subdirs from a parent folder\n"
+                       "• Use the list below to manage your selection\n"
+                       "• Click OK when finished")
+
+        instruction_label = ttk.Label(main_frame, text=instructions, justify='left')
+        instruction_label.pack(pady=(0, 10), anchor='w')
+
+        # Buttons frame
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill='x', pady=(0, 10))
+
+        ttk.Button(button_frame, text="Browse & Add Directory",
+                  command=self.add_single_directory).pack(side='left', padx=(0, 5))
+        ttk.Button(button_frame, text="Add All Subdirectories",
+                  command=self.add_subdirectories).pack(side='left', padx=(0, 5))
+        ttk.Button(button_frame, text="Remove Selected",
+                  command=self.remove_selected).pack(side='left', padx=(0, 5))
+        ttk.Button(button_frame, text="Clear All",
+                  command=self.clear_all).pack(side='left', padx=(0, 5))
+
+        # Directory list with scrollbar
+        list_frame = ttk.Frame(main_frame)
+        list_frame.pack(fill='both', expand=True, pady=(0, 10))
+
+        self.dir_listbox = tk.Listbox(list_frame, selectmode='extended', height=15)
+        scrollbar = ttk.Scrollbar(list_frame, orient='vertical', command=self.dir_listbox.yview)
+        self.dir_listbox.configure(yscrollcommand=scrollbar.set)
+
+        self.dir_listbox.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+
+        # Status label
+        self.status_label = ttk.Label(main_frame, text="No directories selected")
+        self.status_label.pack(pady=(0, 10))
+
+        # Bottom buttons
+        bottom_frame = ttk.Frame(main_frame)
+        bottom_frame.pack(fill='x')
+
+        ttk.Button(bottom_frame, text="Cancel", command=self.cancel).pack(side='right', padx=(5, 0))
+        ttk.Button(bottom_frame, text="OK", command=self.ok).pack(side='right')
+
+    def add_single_directory(self):
+        """Add a single directory"""
+        directory = filedialog.askdirectory(
+            parent=self.dialog,
+            title="Select directory containing images"
+        )
+
+        if directory and directory not in self.selected_directories:
+            self.selected_directories.append(directory)
+            self.dir_listbox.insert(tk.END, directory)
+            self.update_status()
+
+    def add_subdirectories(self):
+        """Add all subdirectories from a parent directory"""
+        parent_dir = filedialog.askdirectory(
+            parent=self.dialog,
+            title="Select parent directory (all subdirectories will be added)"
+        )
+
+        if not parent_dir:
+            return
+
+        try:
+            subdirs = []
+            for item in os.listdir(parent_dir):
+                item_path = os.path.join(parent_dir, item)
+                if os.path.isdir(item_path):
+                    subdirs.append(item_path)
+
+            if not subdirs:
+                messagebox.showinfo("No Subdirectories",
+                                   "No subdirectories found in the selected parent directory.",
+                                   parent=self.dialog)
+                return
+
+            # Ask for confirmation
+            message = f"Found {len(subdirs)} subdirectories. Add all of them?"
+            if messagebox.askyesno("Confirm Add Subdirectories", message, parent=self.dialog):
+                added_count = 0
+                for subdir in subdirs:
+                    if subdir not in self.selected_directories:
+                        self.selected_directories.append(subdir)
+                        self.dir_listbox.insert(tk.END, subdir)
+                        added_count += 1
+
+                messagebox.showinfo("Subdirectories Added",
+                                   f"Added {added_count} new directories (skipped {len(subdirs) - added_count} duplicates).",
+                                   parent=self.dialog)
+                self.update_status()
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Error reading subdirectories: {e}", parent=self.dialog)
+
+    def remove_selected(self):
+        """Remove selected directories from list"""
+        selection = self.dir_listbox.curselection()
+        if not selection:
+            return
+
+        # Remove in reverse order to maintain indices
+        for index in reversed(selection):
+            self.selected_directories.pop(index)
+            self.dir_listbox.delete(index)
+
+        self.update_status()
+
+    def clear_all(self):
+        """Clear all directories"""
+        if self.selected_directories:
+            if messagebox.askyesno("Clear All", "Remove all directories from the list?", parent=self.dialog):
+                self.selected_directories.clear()
+                self.dir_listbox.delete(0, tk.END)
+                self.update_status()
+
+    def update_status(self):
+        """Update status label"""
+        count = len(self.selected_directories)
+        if count == 0:
+            self.status_label.config(text="No directories selected")
+        elif count == 1:
+            self.status_label.config(text="1 directory selected")
+        else:
+            self.status_label.config(text=f"{count} directories selected")
+
+    def ok(self):
+        """OK button pressed"""
+        self.result = self.selected_directories.copy()
+        self.dialog.destroy()
+
+    def cancel(self):
+        """Cancel button pressed"""
+        self.result = None
+        self.dialog.destroy()
 
 
 class BatchWormTrackerGUI:
@@ -738,7 +961,7 @@ class BatchWormTrackerGUI:
         max_thresh_entry.bind('<KeyRelease>', self.validate_threshold_params)
 
         # Info label
-        ttk.Label(threshold_frame, text="Range: 0-255. Higher values detect brighter objects.", 
+        ttk.Label(threshold_frame, text="Range: 0-255. Higher values detect brighter objects.",
                  font=('TkDefaultFont', 8), foreground='gray').pack(anchor='w', pady=(5,0))
 
     def create_blob_config(self, parent):
@@ -765,7 +988,7 @@ class BatchWormTrackerGUI:
         max_blob_entry.bind('<KeyRelease>', self.validate_blob_params)
 
         # Info label
-        ttk.Label(blob_frame, text="Filters detected objects by area. Adjust for worm size.", 
+        ttk.Label(blob_frame, text="Filters detected objects by area. Adjust for worm size.",
                  font=('TkDefaultFont', 8), foreground='gray').pack(anchor='w', pady=(5,0))
 
     def create_tracking_config(self, parent):
@@ -805,15 +1028,37 @@ class BatchWormTrackerGUI:
         algo_frame.pack(fill='x', pady=2)
         ttk.Label(algo_frame, text="Assignment Algorithm:").pack(side='left', anchor='w')
         self.algorithm_var = tk.StringVar(value="Greedy" if not self.config.use_hungarian else "Hungarian")
-        algo_combo = ttk.Combobox(algo_frame, textvariable=self.algorithm_var, 
+        algo_combo = ttk.Combobox(algo_frame, textvariable=self.algorithm_var,
                                   values=["Greedy", "Hungarian"], width=12, state="readonly")
         algo_combo.pack(side='right')
         algo_combo.bind('<<ComboboxSelected>>', self.update_algorithm)
 
         # Info labels
-        ttk.Label(tracking_frame, text="Trajectory weight: 0.7 recommended for ID swap prevention", 
+        ttk.Label(tracking_frame, text="Trajectory weight: 0.7 recommended for ID swap prevention",
                  font=('TkDefaultFont', 8), foreground='gray').pack(anchor='w', pady=(5,0))
-        ttk.Label(tracking_frame, text="Greedy algorithm recommended for worm tracking", 
+        ttk.Label(tracking_frame, text="Greedy algorithm recommended for worm tracking",
+                 font=('TkDefaultFont', 8), foreground='gray').pack(anchor='w')
+
+        # Movement filter section
+        movement_filter_frame = ttk.Frame(tracking_frame)
+        movement_filter_frame.pack(fill='x', pady=(10,2))
+        self.filter_stationary_var = tk.BooleanVar(value=self.config.filter_stationary_tracks)
+        movement_check = ttk.Checkbutton(movement_filter_frame, text="Filter Stationary Tracks",
+                                        variable=self.filter_stationary_var,
+                                        command=self.update_movement_filter)
+        movement_check.pack(side='left', anchor='w')
+
+        # Min displacement distance
+        displacement_frame = ttk.Frame(tracking_frame)
+        displacement_frame.pack(fill='x', pady=2)
+        ttk.Label(displacement_frame, text="Min Displacement Distance (pixels):").pack(side='left', anchor='w')
+        self.min_displacement_var = tk.StringVar(value=str(self.config.min_displacement_distance))
+        displacement_entry = ttk.Entry(displacement_frame, textvariable=self.min_displacement_var, width=10)
+        displacement_entry.pack(side='right')
+        displacement_entry.bind('<KeyRelease>', self.validate_tracking_params)
+
+        # Movement filter info
+        ttk.Label(tracking_frame, text="Removes tracks that don't move significantly from start to end position",
                  font=('TkDefaultFont', 8), foreground='gray').pack(anchor='w')
 
     def create_nose_config(self, parent):
@@ -825,7 +1070,7 @@ class BatchWormTrackerGUI:
         nose_enable_frame = ttk.Frame(nose_frame)
         nose_enable_frame.pack(fill='x', pady=2)
         self.nose_enabled_var = tk.BooleanVar(value=self.config.nose_detection_enabled)
-        nose_check = ttk.Checkbutton(nose_enable_frame, text="Enable Nose Detection", 
+        nose_check = ttk.Checkbutton(nose_enable_frame, text="Enable Nose Detection",
                                      variable=self.nose_enabled_var,
                                      command=self.update_nose_detection)
         nose_check.pack(side='left', anchor='w')
@@ -849,7 +1094,7 @@ class BatchWormTrackerGUI:
         movement_entry.bind('<KeyRelease>', self.validate_nose_params)
 
         # Info label
-        ttk.Label(nose_frame, text="Detects worm front based on locomotion direction", 
+        ttk.Label(nose_frame, text="Detects worm front based on locomotion direction",
                  font=('TkDefaultFont', 8), foreground='gray').pack(anchor='w', pady=(5,0))
 
     def create_action_buttons(self, parent):
@@ -889,7 +1134,8 @@ class BatchWormTrackerGUI:
         buttons_frame = ttk.Frame(dir_frame)
         buttons_frame.pack(fill='x', pady=(0, 10))
 
-        ttk.Button(buttons_frame, text="Add Directory", command=self.add_directory).pack(side='left', padx=(0, 5))
+        # SIMPLIFIED: Single smart "Add Directories" button
+        ttk.Button(buttons_frame, text="Add Directories", command=self.add_directories).pack(side='left', padx=(0, 5))
         ttk.Button(buttons_frame, text="Remove Selected", command=self.remove_directory).pack(side='left', padx=(0, 5))
         ttk.Button(buttons_frame, text="Clear All", command=self.clear_directories).pack(side='left', padx=(0, 5))
         ttk.Button(buttons_frame, text="Start Batch Processing", command=self.start_batch_processing).pack(side='right')
@@ -898,11 +1144,11 @@ class BatchWormTrackerGUI:
         list_frame = ttk.Frame(dir_frame)
         list_frame.pack(fill='both', expand=True)
 
-        # Listbox with scrollbar
+        # Listbox with scrollbar - Multiple selection mode
         list_scroll_frame = ttk.Frame(list_frame)
         list_scroll_frame.pack(fill='both', expand=True)
 
-        self.dir_listbox = tk.Listbox(list_scroll_frame, height=8)
+        self.dir_listbox = tk.Listbox(list_scroll_frame, height=8, selectmode='extended')
         dir_scrollbar = ttk.Scrollbar(list_scroll_frame, orient='vertical', command=self.dir_listbox.yview)
         self.dir_listbox.configure(yscrollcommand=dir_scrollbar.set)
 
@@ -959,17 +1205,17 @@ class BatchWormTrackerGUI:
         ttk.Button(button_frame, text="Clear Results", command=self.clear_results).pack(side='left', padx=(10, 0))
         ttk.Button(button_frame, text="Exit", command=self.root.quit).pack(side='right')
 
-    # Parameter validation methods
+    # Parameter validation methods (same as before)
     def validate_threshold_params(self, event=None):
         """Validate threshold parameters"""
         try:
             min_val = int(self.min_thresh_var.get())
             max_val = int(self.max_thresh_var.get())
-            
+
             if not (0 <= min_val <= 255) or not (0 <= max_val <= 255) or min_val >= max_val:
                 self.config_status_label.config(text="Invalid threshold range", foreground='red')
                 return False
-            
+
             self.config.threshold_min = min_val
             self.config.threshold_max = max_val
             self.update_config_summary()
@@ -983,11 +1229,11 @@ class BatchWormTrackerGUI:
         try:
             min_val = int(self.min_blob_var.get())
             max_val = int(self.max_blob_var.get())
-            
+
             if min_val < 1 or max_val < min_val:
                 self.config_status_label.config(text="Invalid blob size range", foreground='red')
                 return False
-            
+
             self.config.min_blob_size = min_val
             self.config.max_blob_size = max_val
             self.update_config_summary()
@@ -1002,14 +1248,16 @@ class BatchWormTrackerGUI:
             max_dist = int(self.max_dist_var.get())
             traj_weight = float(self.traj_weight_var.get())
             min_track = int(self.min_track_var.get())
-            
-            if max_dist < 1 or not (0.0 <= traj_weight <= 1.0) or min_track < 1:
+            min_displacement = float(self.min_displacement_var.get())
+
+            if max_dist < 1 or not (0.0 <= traj_weight <= 1.0) or min_track < 1 or min_displacement < 0:
                 self.config_status_label.config(text="Invalid tracking parameters", foreground='red')
                 return False
-            
+
             self.config.max_distance = max_dist
             self.config.trajectory_weight = traj_weight
             self.config.min_track_length = min_track
+            self.config.min_displacement_distance = min_displacement
             self.update_config_summary()
             return True
         except ValueError:
@@ -1021,11 +1269,11 @@ class BatchWormTrackerGUI:
         try:
             smooth_frames = int(self.nose_smooth_var.get())
             min_movement = float(self.nose_movement_var.get())
-            
+
             if not (2 <= smooth_frames <= 10) or min_movement < 0.1:
                 self.config_status_label.config(text="Invalid nose parameters", foreground='red')
                 return False
-            
+
             self.config.nose_smoothing_frames = smooth_frames
             self.config.min_movement_threshold = min_movement
             self.update_config_summary()
@@ -1044,24 +1292,29 @@ class BatchWormTrackerGUI:
         self.config.nose_detection_enabled = self.nose_enabled_var.get()
         self.update_config_summary()
 
+    def update_movement_filter(self):
+        """Update movement filter enabled state"""
+        self.config.filter_stationary_tracks = self.filter_stationary_var.get()
+        self.update_config_summary()
+
     def validate_all_parameters(self):
         """Validate all parameters"""
-        valid = (self.validate_threshold_params() and 
-                self.validate_blob_params() and 
-                self.validate_tracking_params() and 
+        valid = (self.validate_threshold_params() and
+                self.validate_blob_params() and
+                self.validate_tracking_params() and
                 self.validate_nose_params())
-        
+
         if valid:
             self.config_status_label.config(text="All parameters valid", foreground='green')
             # Update tracker with new config
             self.tracker = BatchWormTracker(self.config)
-        
+
         return valid
 
     def reset_to_defaults(self):
         """Reset all parameters to defaults"""
         self.config = BatchConfig()
-        
+
         # Update GUI elements
         self.min_thresh_var.set(str(self.config.threshold_min))
         self.max_thresh_var.set(str(self.config.threshold_max))
@@ -1074,7 +1327,9 @@ class BatchWormTrackerGUI:
         self.nose_enabled_var.set(self.config.nose_detection_enabled)
         self.nose_smooth_var.set(str(self.config.nose_smoothing_frames))
         self.nose_movement_var.set(str(self.config.min_movement_threshold))
-        
+        self.filter_stationary_var.set(self.config.filter_stationary_tracks)
+        self.min_displacement_var.set(str(self.config.min_displacement_distance))
+
         self.config_status_label.config(text="Reset to defaults", foreground='green')
         self.tracker = BatchWormTracker(self.config)
         self.update_config_summary()
@@ -1087,8 +1342,13 @@ class BatchWormTrackerGUI:
         summary += f"Trajectory Weight: {self.config.trajectory_weight} | "
         summary += f"Min Track: {self.config.min_track_length} frames | "
         summary += f"Algorithm: {'Hungarian' if self.config.use_hungarian else 'Greedy'} | "
+        summary += f"Movement Filter: {'ON' if self.config.filter_stationary_tracks else 'OFF'}"
+        if self.config.filter_stationary_tracks:
+            summary += f" (>={self.config.min_displacement_distance}px) | "
+        else:
+            summary += " | "
         summary += f"Nose Detection: {'ON' if self.config.nose_detection_enabled else 'OFF'}"
-        
+
         if hasattr(self, 'config_summary_text'):
             self.config_summary_text.delete(1.0, tk.END)
             self.config_summary_text.insert(1.0, summary)
@@ -1098,16 +1358,16 @@ class BatchWormTrackerGUI:
         if not self.validate_all_parameters():
             messagebox.showerror("Invalid Parameters", "Please fix parameter errors before saving")
             return
-            
+
         file_path = filedialog.asksaveasfilename(
             title="Save Configuration",
             defaultextension=".txt",
             filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
         )
-        
+
         if not file_path:
             return
-            
+
         try:
             with open(file_path, 'w') as f:
                 f.write("# Enhanced Batch Worm Tracker Configuration\n")
@@ -1122,7 +1382,9 @@ class BatchWormTrackerGUI:
                 f.write(f"nose_detection_enabled={self.config.nose_detection_enabled}\n")
                 f.write(f"nose_smoothing_frames={self.config.nose_smoothing_frames}\n")
                 f.write(f"min_movement_threshold={self.config.min_movement_threshold}\n")
-            
+                f.write(f"filter_stationary_tracks={self.config.filter_stationary_tracks}\n")
+                f.write(f"min_displacement_distance={self.config.min_displacement_distance}\n")
+
             messagebox.showinfo("Configuration Saved", f"Configuration saved to:\n{file_path}")
         except Exception as e:
             messagebox.showerror("Save Error", f"Failed to save configuration:\n{e}")
@@ -1133,22 +1395,22 @@ class BatchWormTrackerGUI:
             title="Load Configuration",
             filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
         )
-        
+
         if not file_path:
             return
-            
+
         try:
             with open(file_path, 'r') as f:
                 for line in f:
                     line = line.strip()
                     if line.startswith('#') or not line:
                         continue
-                    
+
                     if '=' in line:
                         key, value = line.split('=', 1)
                         key = key.strip()
                         value = value.strip()
-                        
+
                         try:
                             if key == 'threshold_min':
                                 self.config.threshold_min = int(value)
@@ -1183,42 +1445,78 @@ class BatchWormTrackerGUI:
                             elif key == 'min_movement_threshold':
                                 self.config.min_movement_threshold = float(value)
                                 self.nose_movement_var.set(value)
+                            elif key == 'filter_stationary_tracks':
+                                self.config.filter_stationary_tracks = value.lower() == 'true'
+                                self.filter_stationary_var.set(self.config.filter_stationary_tracks)
+                            elif key == 'min_displacement_distance':
+                                self.config.min_displacement_distance = float(value)
+                                self.min_displacement_var.set(value)
                         except ValueError:
                             continue
-            
+
             if self.validate_all_parameters():
                 self.tracker = BatchWormTracker(self.config)
                 self.update_config_summary()
                 messagebox.showinfo("Configuration Loaded", "Configuration loaded successfully")
             else:
                 messagebox.showwarning("Invalid Configuration", "Some parameters in the file are invalid")
-                
+
         except Exception as e:
             messagebox.showerror("Load Error", f"Failed to load configuration:\n{e}")
 
-    # Batch processing methods (same as before but using self.config)
-    def add_directory(self):
-        """Add a directory to the processing list"""
-        directory = filedialog.askdirectory(title="Select directory containing images")
-        if directory and directory not in self.directories:
-            self.directories.append(directory)
-            self.dir_listbox.insert(tk.END, directory)
-            self.update_status(f"Added directory: {os.path.basename(directory)}")
+    # SIMPLIFIED: Smart directory selection method
+    def add_directories(self):
+        """Smart directory selection - handles both single and multiple"""
+        dialog = SmartDirectoryDialog(self.root)
+        selected_dirs = dialog.show()
+
+        if selected_dirs:
+            added_count = 0
+            for directory in selected_dirs:
+                if directory not in self.directories:
+                    self.directories.append(directory)
+                    self.dir_listbox.insert(tk.END, directory)
+                    added_count += 1
+
+            if added_count > 0:
+                if added_count == 1:
+                    self.update_status(f"Added 1 directory")
+                else:
+                    self.update_status(f"Added {added_count} directories")
+
+                if len(selected_dirs) > added_count:
+                    messagebox.showinfo("Directories Added",
+                                       f"Successfully added {added_count} directories.\n"
+                                       f"Skipped {len(selected_dirs) - added_count} duplicates.")
+            else:
+                self.update_status("No new directories added (all were duplicates)")
 
     def remove_directory(self):
-        """Remove selected directory from the list"""
+        """Remove selected directories from the list"""
         selection = self.dir_listbox.curselection()
-        if selection:
-            index = selection[0]
+        if not selection:
+            messagebox.showinfo("No Selection", "Please select one or more directories to remove")
+            return
+
+        # Remove in reverse order to maintain indices
+        removed_count = 0
+        for index in reversed(selection):
             removed_dir = self.directories.pop(index)
             self.dir_listbox.delete(index)
-            self.update_status(f"Removed directory: {os.path.basename(removed_dir)}")
+            removed_count += 1
+
+        if removed_count == 1:
+            self.update_status(f"Removed 1 directory")
+        else:
+            self.update_status(f"Removed {removed_count} directories")
 
     def clear_directories(self):
         """Clear all directories from the list"""
-        self.directories.clear()
-        self.dir_listbox.delete(0, tk.END)
-        self.update_status("Cleared all directories")
+        if self.directories:
+            if messagebox.askyesno("Clear All", "Remove all directories from the list?"):
+                self.directories.clear()
+                self.dir_listbox.delete(0, tk.END)
+                self.update_status("Cleared all directories")
 
     def update_status(self, message):
         """Update status label"""
@@ -1235,7 +1533,7 @@ class BatchWormTrackerGUI:
         if not self.validate_all_parameters():
             messagebox.showerror("Invalid Parameters", "Please fix parameter errors before processing")
             return
-            
+
         if not self.directories:
             messagebox.showwarning("No Directories", "Please add at least one directory to process")
             return
@@ -1314,7 +1612,7 @@ class BatchWormTrackerGUI:
         """Update the results summary label"""
         if not self.results:
             return
-            
+
         successful = len([r for r in self.results if r.success])
         total = len(self.results)
         summary = f"Processed: {total} directories | Successful: {successful} | Failed: {total - successful}"
@@ -1396,6 +1694,9 @@ class BatchWormTrackerGUI:
         summary += f"  Max Distance: {self.config.max_distance} px\n"
         summary += f"  Trajectory Weight: {self.config.trajectory_weight}\n"
         summary += f"  Min Track Length: {self.config.min_track_length} frames\n"
+        summary += f"  Movement Filter: {'Enabled' if self.config.filter_stationary_tracks else 'Disabled'}\n"
+        if self.config.filter_stationary_tracks:
+            summary += f"  Min Displacement: {self.config.min_displacement_distance} pixels\n"
         summary += f"  Algorithm: {'Hungarian' if self.config.use_hungarian else 'Greedy'}\n"
         summary += f"  Nose Detection: {'Enabled' if self.config.nose_detection_enabled else 'Disabled'}\n"
         if self.config.nose_detection_enabled:
@@ -1422,7 +1723,6 @@ class BatchWormTrackerGUI:
             summary += "\n"
 
         summary += "All tracks.csv files have been saved to their respective directories.\n"
-
         return summary
 
     def export_summary(self):
@@ -1453,6 +1753,9 @@ class BatchWormTrackerGUI:
                 f.write(f"Max Distance: {self.config.max_distance} px\n")
                 f.write(f"Trajectory Weight: {self.config.trajectory_weight}\n")
                 f.write(f"Min Track Length: {self.config.min_track_length} frames\n")
+                f.write(f"Movement Filter: {'Enabled' if self.config.filter_stationary_tracks else 'Disabled'}\n")
+                if self.config.filter_stationary_tracks:
+                    f.write(f"Min Displacement Distance: {self.config.min_displacement_distance} pixels\n")
                 f.write(f"Algorithm: {'Hungarian' if self.config.use_hungarian else 'Greedy'}\n")
                 f.write(f"Nose Detection: {'Enabled' if self.config.nose_detection_enabled else 'Disabled'}\n")
                 if self.config.nose_detection_enabled:
@@ -1501,20 +1804,25 @@ class BatchWormTrackerGUI:
 def main():
     """Main function to run the enhanced batch tracker"""
     print("=" * 70)
-    print("ENHANCED BATCH WORM TRACKER")
+    print("ENHANCED BATCH WORM TRACKER WITH SMART DIRECTORY SELECTION")
     print("Automated processing with adjustable parameters")
     print("=" * 70)
     print("\nNEW FEATURES:")
+    print("• Single smart 'Add Directories' button handles both single and multiple selection")
+    print("• Add all subdirectories from parent folder")
+    print("• Multi-select removal of directories")
     print("• Full parameter customization with validation")
     print("• Tabbed interface for better organization")
     print("• Save/load configuration files")
     print("• Real-time parameter validation")
     print("• Enhanced results summary")
+    print("• Stationary track filtering")
     print("• Same core tracking as main tracker")
     print("\nFEATURES:")
     print("• Trajectory-aware tracking with configurable weight")
     print("• Adjustable thresholding and blob filtering")
     print("• Nose detection with configurable parameters")
+    print("• Movement distance filtering for stationary objects")
     print("• Quality assessment (flags noisy/empty results)")
     print("• Comprehensive summary reports")
     print("• Network drive compatible")
@@ -1525,6 +1833,8 @@ def main():
     print("\nWORKFLOW:")
     print("1. Configure parameters in the Configuration tab")
     print("2. Add directories in the Batch Processing tab")
+    print("   - Click 'Add Directories' for flexible selection options")
+    print("   - Select single directories or use bulk operations")
     print("3. Start processing and monitor progress")
     print("4. Review results in the Results tab")
     print("\nSTARTING ENHANCED BATCH TRACKER GUI...")
