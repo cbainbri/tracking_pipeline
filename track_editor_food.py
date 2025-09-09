@@ -2,10 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-SWT Track Editor with Persistent Object Optimization
+SWT Track Editor with Persistent Object Optimization and Fixed Selection System
 
-Key optimization: Persistent imshow object and track collections that never get cleared,
-using set_data() and set_segments() for ultra-fast updates.
+Key fixes:
+- Robust selection state management with single source of truth
+- Event debouncing to prevent race conditions
+- Improved track detection algorithm
+- Synchronized canvas and listbox selection
+- Layout stability fixes
 """
 
 import cv2
@@ -49,6 +53,7 @@ class Config:
     SELECTION_RADIUS = 30
     PREFETCH_RADIUS = 20
     PERFORMANCE_UPDATE_INTERVAL = 2000
+    SELECTION_DEBOUNCE_MS = 50
 
     # Threading
     MAX_BACKGROUND_WORKERS = 3
@@ -98,6 +103,94 @@ class PrerenderedTrackData:
     line_segments: List[np.ndarray]
     segment_frames: List[int]
     color: str
+
+# ================== SELECTION MANAGER ==================
+
+class SelectionManager:
+    """Centralized selection state management with race condition protection"""
+
+    def __init__(self, root):
+        self.root = root
+        self.selected_tracks: set = set()
+        self._selection_lock = False
+        self._pending_update = None
+        self._callbacks = {
+            'listbox': None,
+            'canvas': None,
+            'ui': None
+        }
+
+    def register_callback(self, source: str, callback):
+        """Register update callbacks for different UI components"""
+        self._callbacks[source] = callback
+
+    def update_selection(self, new_selection: set, source: str = "unknown"):
+        """Thread-safe selection update with debouncing"""
+        if self._selection_lock:
+            logger.debug(f"Selection update from {source} ignored - lock active")
+            return False
+
+        # Cancel pending update
+        if self._pending_update:
+            self.root.after_cancel(self._pending_update)
+
+        # Schedule debounced update
+        self._pending_update = self.root.after(
+            Config.SELECTION_DEBOUNCE_MS,
+            lambda: self._apply_selection_update(new_selection, source)
+        )
+        return True
+
+    def _apply_selection_update(self, new_selection: set, source: str):
+        """Apply the actual selection update"""
+        self._pending_update = None
+
+        if self._selection_lock:
+            return
+
+        old_selection = self.selected_tracks.copy()
+        self.selected_tracks = set(new_selection)
+
+        if old_selection != self.selected_tracks:
+            logger.debug(f"Selection changed from {source}: {sorted(self.selected_tracks)}")
+            self._sync_all_displays(exclude_source=source)
+
+    def _sync_all_displays(self, exclude_source: str):
+        """Synchronize all UI displays except the source"""
+        self._selection_lock = True
+        try:
+            for callback_source, callback in self._callbacks.items():
+                if callback_source != exclude_source and callback:
+                    try:
+                        callback(self.selected_tracks)
+                    except Exception as e:
+                        logger.error(f"Error syncing {callback_source}: {e}")
+        finally:
+            self._selection_lock = False
+
+    def handle_track_click(self, track_id: int, ctrl_held: bool = False) -> bool:
+        """Handle track selection logic (ctrl+click support)"""
+        if ctrl_held:
+            if track_id in self.selected_tracks:
+                new_selection = self.selected_tracks - {track_id}
+            else:
+                new_selection = self.selected_tracks | {track_id}
+        else:
+            new_selection = {track_id}
+
+        return self.update_selection(new_selection, "click")
+
+    def get_selection(self) -> set:
+        """Get current selection (read-only)"""
+        return self.selected_tracks.copy()
+
+    def clear_selection(self, source: str = "manual"):
+        """Clear all selection"""
+        return self.update_selection(set(), source)
+
+    def select_all(self, all_tracks: set, source: str = "manual"):
+        """Select all tracks"""
+        return self.update_selection(all_tracks, source)
 
 # ================== IMAGE LOADING SYSTEM ==================
 
@@ -595,20 +688,20 @@ class TrackManager:
             'merge_viable': True,
             'warnings': []
         }
-        
+
         # Collect all positions and analyze each track
         all_positions_by_frame = {}
-        
+
         for track_id in track_ids:
             if track_id not in self.tracks or track_id in self.deleted_tracks:
                 analysis['warnings'].append(f"Track {track_id} does not exist or is deleted")
                 continue
-                
+
             positions = self.tracks[track_id]
             if not positions:
                 analysis['warnings'].append(f"Track {track_id} is empty")
                 continue
-                
+
             # Track summary
             frames = [pos.frame for pos in positions]
             analysis['track_summaries'][track_id] = {
@@ -621,21 +714,21 @@ class TrackManager:
                     sum(pos.y for pos in positions) / len(positions)
                 )
             }
-            
+
             analysis['total_positions'] += len(positions)
-            
+
             # Check for frame conflicts
             for pos in positions:
                 frame = pos.frame
                 if frame not in all_positions_by_frame:
                     all_positions_by_frame[frame] = []
                 all_positions_by_frame[frame].append((track_id, pos))
-        
+
         # Identify conflicts
         for frame, positions in all_positions_by_frame.items():
             if len(positions) > 1:
                 analysis['frame_conflicts'][frame] = positions
-        
+
         # Check for temporal gaps
         if all_positions_by_frame:
             all_frames = sorted(all_positions_by_frame.keys())
@@ -643,61 +736,61 @@ class TrackManager:
                 gap = all_frames[i + 1] - all_frames[i]
                 if gap > 1:
                     analysis['temporal_gaps'].append((all_frames[i], all_frames[i + 1], gap - 1))
-        
+
         # Determine if merge is viable
         if len(analysis['frame_conflicts']) > len(all_positions_by_frame) * 0.5:
             analysis['merge_viable'] = False
             analysis['warnings'].append("Too many frame conflicts - over 50% of frames have overlapping tracks")
-        
+
         return analysis
 
-    def _resolve_position_conflict(self, conflicted_positions: List[Tuple[int, TrackPosition]], 
+    def _resolve_position_conflict(self, conflicted_positions: List[Tuple[int, TrackPosition]],
                                  previous_positions: List[TrackPosition]) -> TrackPosition:
         """Resolve conflicts when multiple tracks have positions at the same frame"""
-        
+
         if len(conflicted_positions) == 1:
             return conflicted_positions[0][1]
-        
+
         # Strategy 1: If we have previous track history, choose position closest to trajectory
         if len(previous_positions) >= 2:
             # Calculate expected position based on velocity
             prev_pos = previous_positions[-1]
             prev_prev_pos = previous_positions[-2]
-            
+
             velocity_x = prev_pos.x - prev_prev_pos.x
             velocity_y = prev_pos.y - prev_prev_pos.y
-            
+
             expected_x = prev_pos.x + velocity_x
             expected_y = prev_pos.y + velocity_y
-            
+
             best_distance = float('inf')
             best_position = conflicted_positions[0][1]
-            
+
             for track_id, pos in conflicted_positions:
                 distance = np.sqrt((pos.x - expected_x)**2 + (pos.y - expected_y)**2)
                 if distance < best_distance:
                     best_distance = distance
                     best_position = pos
-            
+
             logger.debug(f"Conflict resolution: chose position based on trajectory (distance: {best_distance:.1f})")
             return best_position
-        
+
         # Strategy 2: If no trajectory history, choose position closest to previous position
         elif len(previous_positions) >= 1:
             prev_pos = previous_positions[-1]
-            
+
             best_distance = float('inf')
             best_position = conflicted_positions[0][1]
-            
+
             for track_id, pos in conflicted_positions:
                 distance = np.sqrt((pos.x - prev_pos.x)**2 + (pos.y - prev_pos.y)**2)
                 if distance < best_distance:
                     best_distance = distance
                     best_position = pos
-            
+
             logger.debug(f"Conflict resolution: chose closest position (distance: {best_distance:.1f})")
             return best_position
-        
+
         # Strategy 3: No history - choose from lowest track ID (most predictable)
         conflicted_positions.sort(key=lambda x: x[0])  # Sort by track ID
         chosen = conflicted_positions[0]
@@ -711,33 +804,33 @@ class TrackManager:
             return False
 
         logger.info(f"MERGE: Starting merge of tracks {track_ids}")
-        
+
         # Analyze tracks before merging
         analysis = self._analyze_track_conflicts(track_ids)
-        
+
         # Print detailed analysis
         logger.info("MERGE ANALYSIS:")
         logger.info(f"  Total positions to merge: {analysis['total_positions']}")
         logger.info(f"  Frame conflicts detected: {len(analysis['frame_conflicts'])}")
         logger.info(f"  Temporal gaps: {len(analysis['temporal_gaps'])}")
-        
+
         for track_id, summary in analysis['track_summaries'].items():
             logger.info(f"  Track {track_id}: {summary['count']} positions, "
                        f"frames {summary['frame_range']}, "
                        f"avg pos ({summary['avg_position'][0]:.1f}, {summary['avg_position'][1]:.1f})")
-        
+
         if analysis['warnings']:
             for warning in analysis['warnings']:
                 logger.warning(f"  WARNING: {warning}")
-        
+
         if not analysis['merge_viable']:
             logger.error("MERGE: Merge not viable due to excessive conflicts")
             return False
-        
+
         # Proceed with merge
         target_id = track_ids[0]
         logger.info(f"MERGE: Target track ID: {target_id}")
-        
+
         # Collect all positions grouped by frame
         frame_positions = {}
         for track_id in track_ids:
@@ -747,14 +840,14 @@ class TrackManager:
                     if frame not in frame_positions:
                         frame_positions[frame] = []
                     frame_positions[frame].append((track_id, pos))
-        
+
         # Resolve conflicts and build final track
         final_positions = []
         conflicts_resolved = 0
-        
+
         for frame in sorted(frame_positions.keys()):
             positions = frame_positions[frame]
-            
+
             if len(positions) == 1:
                 # No conflict
                 final_positions.append(positions[0][1])
@@ -763,39 +856,39 @@ class TrackManager:
                 chosen_position = self._resolve_position_conflict(positions, final_positions)
                 final_positions.append(chosen_position)
                 conflicts_resolved += 1
-                
+
                 # Log conflict details
                 conflict_details = [(tid, f"({pos.x:.1f},{pos.y:.1f})") for tid, pos in positions]
                 logger.debug(f"MERGE: Frame {frame} conflict - chose from {conflict_details}")
-        
+
         # Validate merge result
         if not final_positions:
             logger.error("MERGE: No positions to merge")
             return False
-        
+
         logger.info(f"MERGE: Final track has {len(final_positions)} positions")
         logger.info(f"MERGE: Resolved {conflicts_resolved} frame conflicts")
         logger.info(f"MERGE: Frame range: {final_positions[0].frame}-{final_positions[-1].frame}")
-        
+
         # Set the merged track
         self.tracks[target_id] = final_positions
-        
+
         # Mark other tracks as deleted
         for track_id in track_ids[1:]:
             self.deleted_tracks.add(track_id)
             logger.info(f"MERGE: Marked track {track_id} as deleted")
-        
+
         # Final validation
         gaps = []
         for i in range(len(final_positions) - 1):
             gap = final_positions[i + 1].frame - final_positions[i].frame
             if gap > 1:
                 gaps.append(gap - 1)
-        
+
         if gaps:
             total_missing = sum(gaps)
             logger.info(f"MERGE: Track has {len(gaps)} gaps totaling {total_missing} missing frames")
-        
+
         logger.info(f"MERGE: Successfully merged {len(track_ids)} tracks into track {target_id}")
         return True
 
@@ -898,10 +991,10 @@ class TrackManager:
         """Get all track IDs that aren't deleted"""
         return [tid for tid in self.tracks.keys() if tid not in self.deleted_tracks]
 
-# ================== PERSISTENT TRACK OVERLAY SYSTEM ==================
+# ================== ENHANCED TRACK OVERLAY SYSTEM ==================
 
 class PersistentTrackOverlay:
-    """Persistent track overlay system with set_data() and set_segments() optimization"""
+    """Persistent track overlay system with improved track detection"""
 
     def __init__(self, ax, canvas):
         self.ax = ax
@@ -913,6 +1006,10 @@ class PersistentTrackOverlay:
         self.label_texts: List = []
         self.coordinate_mode_text = None
         self.selection_mode_text = None
+
+        # Enhanced track detection
+        self.current_frame = 0
+        self.selection_radius = Config.SELECTION_RADIUS
 
         # Track state for updates
         self.tracks_need_update = True
@@ -1026,8 +1123,8 @@ class PersistentTrackOverlay:
                               show_full_tracks: bool = False):
         """Update visibility of existing collections without recreation"""
 
-        # Store use_nose for mode indicator
-        self._use_nose = use_nose
+        # Store current frame for track detection
+        self.current_frame = current_frame
 
         # Clear previous position scatter and labels only
         if self.position_scatter:
@@ -1145,31 +1242,108 @@ class PersistentTrackOverlay:
 
         if editing_enabled and selection_mode:
             self.selection_mode_text = self.ax.text(
-                0.02, 0.98, "SELECTION MODE: Click tracks or use list",
-                transform=self.ax.transAxes, fontsize=12, fontweight='bold',
+                0.02, 0.98, "SELECTION MODE: Click tracks or use list (Ctrl+click for multi-select)",
+                transform=self.ax.transAxes, fontsize=11, fontweight='bold',
                 bbox=dict(boxstyle='round,pad=0.5', facecolor='yellow', alpha=0.8),
                 verticalalignment='top', zorder=10
             )
 
-    def find_track_at_point(self, click_x: float, click_y: float, selection_radius: float = Config.SELECTION_RADIUS) -> Optional[int]:
-        """Find track at a given point by checking both current positions and track segments"""
-        closest_track = None
-        min_distance = float('inf')
+    def find_track_at_point(self, click_x: float, click_y: float) -> Optional[int]:
+        """Enhanced track detection - prioritize current positions, then recent segments"""
+        if click_x is None or click_y is None:
+            return None
+
+        candidates = []
+
+        # Priority 1: Check current positions first (highest accuracy)
+        for track_id, prerendered_track in self.prerendered_tracks.items():
+            current_position = self._get_current_position(track_id)
+            if current_position:
+                x, y = current_position
+                distance = self._point_distance(click_x, click_y, x, y)
+                if distance < self.selection_radius:
+                    candidates.append((distance, track_id, "current"))
+
+        # If we found current position candidates, return the closest
+        if candidates:
+            candidates.sort(key=lambda x: x[0])
+            logger.debug(f"Track selection: found current position for track {candidates[0][1]} at distance {candidates[0][0]:.1f}")
+            return candidates[0][1]
+
+        # Priority 2: Check recent trail segments (last 10 frames)
+        recent_frame_threshold = max(0, self.current_frame - 10)
 
         for track_id, prerendered_track in self.prerendered_tracks.items():
-            # Check distance to any part of the track segments
-            for segment in prerendered_track.line_segments:
+            segment_distance = self._closest_recent_segment_distance(
+                track_id, click_x, click_y, recent_frame_threshold)
+            if segment_distance < self.selection_radius:
+                candidates.append((segment_distance, track_id, "recent_trail"))
+
+        # Priority 3: Check all trail segments as last resort
+        if not candidates:
+            for track_id, prerendered_track in self.prerendered_tracks.items():
+                segment_distance = self._closest_segment_distance(track_id, click_x, click_y)
+                if segment_distance < self.selection_radius * 1.5:  # Slightly larger radius for trails
+                    candidates.append((segment_distance, track_id, "trail"))
+
+        if candidates:
+            candidates.sort(key=lambda x: x[0])
+            logger.debug(f"Track selection: found {candidates[0][2]} for track {candidates[0][1]} at distance {candidates[0][0]:.1f}")
+            return candidates[0][1]
+
+        return None
+
+    def _get_current_position(self, track_id: int) -> Optional[Tuple[float, float]]:
+        """Get current position for a track"""
+        if track_id not in self.prerendered_tracks:
+            return None
+
+        prerendered_track = self.prerendered_tracks[track_id]
+        for x, y, frame in prerendered_track.display_positions:
+            if frame == self.current_frame:
+                return (x, y)
+        return None
+
+    def _point_distance(self, x1: float, y1: float, x2: float, y2: float) -> float:
+        """Calculate distance between two points"""
+        return np.sqrt((x1 - x2)**2 + (y1 - y2)**2)
+
+    def _closest_recent_segment_distance(self, track_id: int, click_x: float, click_y: float,
+                                       frame_threshold: int) -> float:
+        """Find closest distance to recent segments of a track"""
+        if track_id not in self.prerendered_tracks:
+            return float('inf')
+
+        prerendered_track = self.prerendered_tracks[track_id]
+        min_distance = float('inf')
+
+        for i, segment_frame in enumerate(prerendered_track.segment_frames):
+            if segment_frame >= frame_threshold and i < len(prerendered_track.line_segments):
+                segment = prerendered_track.line_segments[i]
                 if len(segment) == 2:
                     x1, y1 = segment[0]
                     x2, y2 = segment[1]
-                    
-                    # Calculate distance from point to line segment
                     distance = self._point_to_line_distance(click_x, click_y, x1, y1, x2, y2)
-                    if distance < min_distance and distance < selection_radius:
-                        min_distance = distance
-                        closest_track = track_id
+                    min_distance = min(min_distance, distance)
 
-        return closest_track
+        return min_distance
+
+    def _closest_segment_distance(self, track_id: int, click_x: float, click_y: float) -> float:
+        """Find closest distance to any segment of a track"""
+        if track_id not in self.prerendered_tracks:
+            return float('inf')
+
+        prerendered_track = self.prerendered_tracks[track_id]
+        min_distance = float('inf')
+
+        for segment in prerendered_track.line_segments:
+            if len(segment) == 2:
+                x1, y1 = segment[0]
+                x2, y2 = segment[1]
+                distance = self._point_to_line_distance(click_x, click_y, x1, y1, x2, y2)
+                min_distance = min(min_distance, distance)
+
+        return min_distance
 
     def _point_to_line_distance(self, px: float, py: float, x1: float, y1: float, x2: float, y2: float) -> float:
         """Calculate shortest distance from point to line segment"""
@@ -1177,21 +1351,21 @@ class PersistentTrackOverlay:
         line_vec = np.array([x2 - x1, y2 - y1])
         # Vector from line start to point
         point_vec = np.array([px - x1, py - y1])
-        
+
         # Length squared of line segment
         line_len_sq = np.dot(line_vec, line_vec)
-        
+
         if line_len_sq == 0:
             # Degenerate case: line is actually a point
             return np.sqrt((px - x1)**2 + (py - y1)**2)
-        
+
         # Project point onto line, clamped to segment
         t = max(0, min(1, np.dot(point_vec, line_vec) / line_len_sq))
-        
+
         # Find closest point on segment
         closest_x = x1 + t * line_vec[0]
         closest_y = y1 + t * line_vec[1]
-        
+
         # Return distance to closest point
         return np.sqrt((px - closest_x)**2 + (py - closest_y)**2)
 
@@ -1242,13 +1416,19 @@ class PersistentTrackOverlay:
 # ================== MAIN APPLICATION ==================
 
 class UltraOptimizedTrackEditor:
-    """Main application with persistent object optimization and robust update handling"""
+    """Main application with fixed selection system and persistent object optimization"""
 
     def __init__(self):
         # Core components
         self.image_cache: Optional[LazyImageCache] = None
         self.track_manager = TrackManager()
         self.track_overlay: Optional[PersistentTrackOverlay] = None
+
+        # Create root window first
+        self.root = tk.Tk()
+
+        # Initialize selection manager
+        self.selection_manager = SelectionManager(self.root)
 
         # Application state
         self.current_frame = 0
@@ -1263,11 +1443,10 @@ class UltraOptimizedTrackEditor:
         self._playback_timer = None
         self._slider_timer = None
         self._timer_generation = 0
-        
+
         # Race condition protection
         self._frame_update_pending = False
         self._draw_pending = False
-        self._selection_update_pending = False  # NEW: Prevent selection race conditions
 
         # Display options
         self.show_trails = True
@@ -1280,7 +1459,6 @@ class UltraOptimizedTrackEditor:
         # Editing state
         self.editing_enabled = False
         self.selection_mode = False
-        self.selected_tracks: set = set()
 
         # Performance tracking
         self.frame_times = deque(maxlen=60)
@@ -1292,10 +1470,65 @@ class UltraOptimizedTrackEditor:
         # Initialize GUI
         self.setup_gui()
 
+        # Register selection callbacks
+        self._register_selection_callbacks()
+
+    def _register_selection_callbacks(self):
+        """Register callbacks for selection synchronization"""
+        self.selection_manager.register_callback('listbox', self._sync_listbox_selection)
+        self.selection_manager.register_callback('canvas', self._sync_canvas_selection)
+        self.selection_manager.register_callback('ui', self._sync_ui_selection)
+
+    def _sync_listbox_selection(self, selected_tracks: set):
+        """Sync listbox with selection (called by selection manager)"""
+        try:
+            # Clear current listbox selection
+            self.track_listbox.selection_clear(0, tk.END)
+
+            # Set new selection
+            if self.track_manager.tracks:
+                track_ids = sorted(self.track_manager.get_all_track_ids())
+                for i, track_id in enumerate(track_ids):
+                    if track_id in selected_tracks:
+                        self.track_listbox.selection_set(i)
+
+            # Update track list display
+            self._update_track_list_display()
+        except Exception as e:
+            logger.error(f"Error syncing listbox selection: {e}")
+
+    def _sync_canvas_selection(self, selected_tracks: set):
+        """Sync canvas display with selection (called by selection manager)"""
+        try:
+            # Update tracks display to show selection
+            self.update_tracks_only(force_redraw=True)
+        except Exception as e:
+            logger.error(f"Error syncing canvas selection: {e}")
+
+    def _sync_ui_selection(self, selected_tracks: set):
+        """Sync UI elements with selection (called by selection manager)"""
+        try:
+            # Update selection label
+            if selected_tracks:
+                selected_list = sorted(list(selected_tracks))
+                self.selected_tracks_label.config(
+                    text=f"Selected: {selected_list[:5]}{'...' if len(selected_list) > 5 else ''} ({len(selected_list)} tracks)")
+            else:
+                self.selected_tracks_label.config(text="Selected: None")
+
+            # Enable/disable split button
+            if hasattr(self, "split_button"):
+                if self.editing_enabled and len(selected_tracks) == 1:
+                    self.split_button.config(state='normal')
+                else:
+                    self.split_button.config(state='disabled')
+
+        except Exception as e:
+            logger.error(f"Error syncing UI selection: {e}")
+
     def setup_gui(self):
-        """Initialize GUI"""
-        self.root = tk.Tk()
-        self.root.title("SWT Track Editor - Persistent Object System")
+        """Initialize GUI with fixed layout"""
+        self.root.title("SWT Track Editor - Fixed Selection System")
         self.root.geometry("1600x1000")
         self.root.minsize(1400, 800)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -1313,7 +1546,7 @@ class UltraOptimizedTrackEditor:
             pass
 
     def create_interface(self):
-        """Create complete interface with compact layout"""
+        """Create complete interface with stable layout"""
         # Main container
         main_container = ttk.Frame(self.root)
         main_container.pack(fill='both', expand=True, padx=5, pady=5)
@@ -1387,19 +1620,22 @@ class UltraOptimizedTrackEditor:
         # Editing controls - all in one line
         self.create_editing_controls(options_frame)
 
-        # Main display area with track list
+        # Main display area with track list - FIXED LAYOUT
         display_container = ttk.Frame(main_container)
         display_container.pack(fill='both', expand=True)
 
-        # Configure grid weights for 80% width to image, 20% to track list
-        display_container.grid_columnconfigure(0, weight=4)  # Image area gets 80%
-        display_container.grid_columnconfigure(1, weight=1)  # Track list gets 20%
+        # Configure grid weights for stable 80/20 split
+        display_container.grid_columnconfigure(0, weight=4, minsize=800)  # Image area: 80% with minimum
+        display_container.grid_columnconfigure(1, weight=1, minsize=300)  # Track list: 20% with minimum
         display_container.grid_rowconfigure(0, weight=1)
 
-        # Image display area (80% width)
+        # Prevent propagation to maintain stable layout
+        display_container.grid_propagate(True)
+
+        # Image display area (80% width) - LEFT SIDE
         self.create_display_area(display_container)
 
-        # Track list area (20% width)
+        # Track list area (20% width) - RIGHT SIDE
         self.create_track_list(display_container)
 
         # Start performance monitoring
@@ -1471,9 +1707,10 @@ class UltraOptimizedTrackEditor:
         self.save_edits_button.pack(side='left', padx=1)
 
     def create_display_area(self, parent):
-        """Create matplotlib display area - 80% width"""
+        """Create matplotlib display area - 80% width, LEFT SIDE"""
         display_frame = ttk.Frame(parent)
         display_frame.grid(row=0, column=0, sticky='nsew', padx=(0, 3))
+        display_frame.grid_propagate(False)  # Maintain size stability
 
         self.viewer_fig = Figure(figsize=(10, 8), tight_layout=True, facecolor='black')
         self.viewer_canvas = FigureCanvasTkAgg(self.viewer_fig, display_frame)
@@ -1485,109 +1722,111 @@ class UltraOptimizedTrackEditor:
         # Initialize track overlay system
         self.track_overlay = PersistentTrackOverlay(self.viewer_ax, self.viewer_canvas)
 
-        # RESTORED: Canvas click handling for track selection
+        # Canvas click handling for track selection
         self.viewer_canvas.mpl_connect('button_press_event', self.on_canvas_click)
 
     def create_track_list(self, parent):
-        """Create scrollable track list for selection - 20% width"""
+        """Create scrollable track list for selection - 20% width, RIGHT SIDE"""
         track_frame = ttk.LabelFrame(parent, text="Track List", padding=3)
         track_frame.grid(row=0, column=1, sticky='nsew')
+        track_frame.grid_propagate(False)  # CRITICAL: Prevent size changes
+
+        # Set fixed dimensions for stability
+        track_frame.configure(width=300, height=600)
 
         # Selection info
         self.selected_tracks_label = ttk.Label(track_frame, text="Selected: None")
         self.selected_tracks_label.pack(fill='x', pady=(0, 1))
 
-        # ADD THIS: Multi-select instruction
-        instruction_label = ttk.Label(track_frame, text="Ctrl+click for multi-select", 
-                                 font=('TkDefaultFont', 8), foreground='gray')
+        # Multi-select instruction
+        instruction_label = ttk.Label(track_frame, text="Ctrl+click for multi-select",
+                                     font=('TkDefaultFont', 8), foreground='gray')
         instruction_label.pack(fill='x', pady=(0, 3))
 
-        # Scrollable listbox
-        list_frame = ttk.Frame(track_frame)
-        list_frame.pack(fill='both', expand=True)
-    
-        # ... rest of the method stays the same
+        # Scrollable listbox - FIXED: Stable container
+        list_container = ttk.Frame(track_frame)
+        list_container.pack(fill='both', expand=True)
+        list_container.pack_propagate(False)  # Prevent size changes
 
         # Create listbox with scrollbar - FIXED: Added exportselection=False
-        scrollbar = ttk.Scrollbar(list_frame)
+        scrollbar = ttk.Scrollbar(list_container)
         scrollbar.pack(side='right', fill='y')
 
-        self.track_listbox = tk.Listbox(list_frame, yscrollcommand=scrollbar.set, 
+        self.track_listbox = tk.Listbox(list_container, yscrollcommand=scrollbar.set,
                                        selectmode='extended', height=20,
                                        exportselection=False)  # KEY FIX: Prevents selection loss
         self.track_listbox.pack(side='left', fill='both', expand=True)
         scrollbar.config(command=self.track_listbox.yview)
 
-        # Bind selection events
+        # Bind selection events with proper event handling
         self.track_listbox.bind('<<ListboxSelect>>', self.on_track_list_select)
 
         # Selection buttons
         button_frame = ttk.Frame(track_frame)
         button_frame.pack(fill='x', pady=(3, 0))
 
-        ttk.Button(button_frame, text="Select All", 
+        ttk.Button(button_frame, text="Select All",
                   command=self.select_all_tracks).pack(side='left', padx=1)
-        ttk.Button(button_frame, text="Clear", 
+        ttk.Button(button_frame, text="Clear",
                   command=self.clear_selection).pack(side='left', padx=1)
 
-    def update_track_list(self):
-        """Update the track listbox with current tracks"""
+    def _update_track_list_display(self):
+        """Update the track listbox display with current tracks and selection"""
+        # Store current scroll position
+        try:
+            first_visible = self.track_listbox.index('@0,0')
+        except:
+            first_visible = 0
+
+        # Clear and rebuild list
         self.track_listbox.delete(0, tk.END)
-        
+
         if self.track_manager.tracks:
-            track_ids = self.track_manager.get_all_track_ids()
-            for track_id in sorted(track_ids):
+            track_ids = sorted(self.track_manager.get_all_track_ids())
+            selected_tracks = self.selection_manager.get_selection()
+
+            for track_id in track_ids:
                 color = self.track_manager.get_track_color(track_id)
                 positions_count = len(self.track_manager.tracks[track_id])
-                selected_indicator = "★" if track_id in self.selected_tracks else ""
-                
+                selected_indicator = "★" if track_id in selected_tracks else ""
+
                 # Format: "Track 5 (120 pts) ★"
                 display_text = f"Track {track_id} ({positions_count} pts) {selected_indicator}"
                 self.track_listbox.insert(tk.END, display_text)
 
-    # ROBUST SELECTION HANDLING WITH RACE CONDITION PROTECTION
-    def _update_selection_safe(self, update_func, *args, **kwargs):
-        """Safely update selection with race condition protection"""
-        if self._selection_update_pending:
-            return
-        
-        self._selection_update_pending = True
+        # Restore scroll position
         try:
-            update_func(*args, **kwargs)
-        finally:
-            self._selection_update_pending = False
+            self.track_listbox.see(first_visible)
+        except:
+            pass
+
+    # ================== ENHANCED SELECTION HANDLING ==================
 
     def on_track_list_select(self, event):
-        """Handle track list selection with synchronization"""
+        """Handle track list selection with proper debouncing"""
         if not self.editing_enabled:
             return
-        
-        def _handle_list_selection():
-            # Get selected indices
+
+        # Get selected indices
+        try:
             selected_indices = self.track_listbox.curselection()
-            
-            # Clear current selection
-            new_selection = set()
-            
-            # Add newly selected tracks
-            if self.track_manager.tracks:
-                track_ids = sorted(self.track_manager.get_all_track_ids())
-                for idx in selected_indices:
-                    if idx < len(track_ids):
-                        track_id = track_ids[idx]
-                        new_selection.add(track_id)
-            
-            # Only update if selection actually changed
-            if new_selection != self.selected_tracks:
-                self.selected_tracks = new_selection
-                self.update_selection_display()
-                self.update_tracks_only()
-                # DON'T update track list here to avoid recursion
-        
-        self._update_selection_safe(_handle_list_selection)
+        except:
+            return
+
+        # Convert indices to track IDs
+        new_selection = set()
+        if self.track_manager.tracks:
+            track_ids = sorted(self.track_manager.get_all_track_ids())
+            for idx in selected_indices:
+                if idx < len(track_ids):
+                    track_id = track_ids[idx]
+                    new_selection.add(track_id)
+
+        # Update selection through manager
+        self.selection_manager.update_selection(new_selection, "listbox")
 
     def on_canvas_click(self, event):
-        """RESTORED: Handle canvas clicks for track selection with enhanced detection"""
+        """Handle canvas clicks for track selection with enhanced detection"""
         if not self.editing_enabled or not self.selection_mode or event.inaxes is None:
             return
 
@@ -1595,89 +1834,25 @@ class UltraOptimizedTrackEditor:
         if click_x is None or click_y is None:
             return
 
-        def _handle_canvas_selection():
-            # Use the enhanced track finding method
-            closest_track = self.track_overlay.find_track_at_point(click_x, click_y)
+        # Find track at click point
+        closest_track = self.track_overlay.find_track_at_point(click_x, click_y)
 
-            # Also check current position detection
-            if closest_track is None and self.track_overlay and self.track_overlay.prerendered_tracks:
-                min_distance = float('inf')
-                for track_id, prerendered_track in self.track_overlay.prerendered_tracks.items():
-                    # Find current position for this track
-                    current_position = None
-                    for x, y, frame in prerendered_track.display_positions:
-                        if frame == self.current_frame:
-                            current_position = (x, y)
-                            break
-
-                    if current_position:
-                        x, y = current_position
-                        distance = np.sqrt((x - click_x)**2 + (y - click_y)**2)
-                        if distance < min_distance and distance < Config.SELECTION_RADIUS:
-                            min_distance = distance
-                            closest_track = track_id
-
-            if closest_track is not None:
-                # Handle Ctrl+click for multiple selection
-                if event.key == 'control':
-                    if closest_track in self.selected_tracks:
-                        self.selected_tracks.remove(closest_track)
-                    else:
-                        self.selected_tracks.add(closest_track)
-                else:
-                    # Single selection
-                    self.selected_tracks = {closest_track}
-
-                self.update_selection_display()
-                self.update_tracks_only()
-                self._sync_listbox_selection()  # Sync with listbox
-
-        self._update_selection_safe(_handle_canvas_selection)
-
-    def _sync_listbox_selection(self):
-        """Synchronize listbox selection with canvas selection"""
-        if not self.track_manager.tracks:
-            return
-            
-        # Clear listbox selection
-        self.track_listbox.selection_clear(0, tk.END)
-        
-        # Set listbox selection to match current selection
-        track_ids = sorted(self.track_manager.get_all_track_ids())
-        for i, track_id in enumerate(track_ids):
-            if track_id in self.selected_tracks:
-                self.track_listbox.selection_set(i)
-        
-        # Update track list display to show stars
-        self.update_track_list()
+        if closest_track is not None:
+            # Handle selection with ctrl+click support
+            ctrl_held = event.key == 'control'
+            self.selection_manager.handle_track_click(closest_track, ctrl_held)
 
     def select_all_tracks(self):
         """Select all tracks in the list"""
         if not self.editing_enabled or not self.track_manager.tracks:
             return
-        
-        def _select_all():
-            self.selected_tracks = set(self.track_manager.get_all_track_ids())
-            
-            # Update listbox selection
-            self.track_listbox.select_set(0, tk.END)
-            
-            self.update_selection_display()
-            self.update_tracks_only()
-            self.update_track_list()
-        
-        self._update_selection_safe(_select_all)
+
+        all_tracks = set(self.track_manager.get_all_track_ids())
+        self.selection_manager.select_all(all_tracks, "button")
 
     def clear_selection(self):
-        """Clear selection with synchronization"""
-        def _clear_selection():
-            self.selected_tracks.clear()
-            self.track_listbox.selection_clear(0, tk.END)
-            self.update_selection_display()
-            self.update_tracks_only()
-            self.update_track_list()
-        
-        self._update_selection_safe(_clear_selection)
+        """Clear selection"""
+        self.selection_manager.clear_selection("button")
 
     def update_nose_option(self):
         """Handle nose coordinate toggle"""
@@ -1721,7 +1896,7 @@ class UltraOptimizedTrackEditor:
                     self.use_nose_var.set(False)
 
                 # Update track list
-                self.update_track_list()
+                self._update_track_list_display()
                 return True
             else:
                 messagebox.showerror("Error", "Could not parse CSV format")
@@ -1794,25 +1969,22 @@ class UltraOptimizedTrackEditor:
         self._background_imshow = None
         self.update_frame_display(force_update=True)
 
-    # ================== ROBUST UPDATE HANDLING ==================
+    # ================== OPTIMIZED UPDATE HANDLING ==================
 
     def update_frame_display(self, force_update=False):
         """Update frame display with improved race condition protection"""
-        # Allow force updates to bypass pending check, but not during playback updates
         if self._frame_update_pending and not force_update:
             return
-        
-        # For playback updates, check if we should abort early
+
         if not force_update and not self.playing:
             return
-        
+
         self._frame_update_pending = True
-        
+
         try:
-            # Check playing state again after acquiring the lock
             if not force_update and not self.playing:
                 return
-                
+
             frame_start_time = time.time()
 
             # Update pre-rendered tracks if needed (only on track edits)
@@ -1842,11 +2014,12 @@ class UltraOptimizedTrackEditor:
 
             # Update track visibility (no recreation)
             if self.track_overlay:
+                selected_tracks = self.selection_manager.get_selection()
                 self.track_overlay.update_visibility_only(
                     current_frame=self.current_frame,
                     trail_length=self.trail_length,
                     use_nose=self.use_nose_coordinates,
-                    selected_tracks=self.selected_tracks,
+                    selected_tracks=selected_tracks,
                     show_trails=self.show_trails_var.get(),
                     show_labels=self.show_labels_var.get(),
                     show_positions=self.show_positions_var.get(),
@@ -1884,15 +2057,16 @@ class UltraOptimizedTrackEditor:
         """Ultra-lightweight track-only update for user interactions"""
         if not self.track_overlay:
             return
-            
+
         start_time = time.perf_counter()
-        
+
         # Only update track visibility - no image operations
+        selected_tracks = self.selection_manager.get_selection()
         self.track_overlay.update_visibility_only(
             current_frame=self.current_frame,
             trail_length=self.trail_length,
             use_nose=self.use_nose_coordinates,
-            selected_tracks=self.selected_tracks,
+            selected_tracks=selected_tracks,
             show_trails=self.show_trails_var.get(),
             show_labels=self.show_labels_var.get(),
             show_positions=self.show_positions_var.get(),
@@ -1900,11 +2074,11 @@ class UltraOptimizedTrackEditor:
             selection_mode=self.selection_mode,
             show_full_tracks=self.show_full_tracks_var.get()
         )
-        
+
         # Only redraw if requested and no other draw is pending
         if force_redraw:
             self._execute_batched_draw()
-        
+
         # Log if update takes too long
         update_time = time.perf_counter() - start_time
         if update_time > 0.005:  # 5ms threshold
@@ -1964,7 +2138,7 @@ class UltraOptimizedTrackEditor:
             self.track_overlay.add_persistent_collections_to_axis()
 
         # Set title and labels
-        title = f"SWT Track Editor - Persistent Object System"
+        title = f"SWT Track Editor - Fixed Selection System"
         if self.use_nose_coordinates:
             title += " (Nose Coordinates)"
 
@@ -2005,12 +2179,10 @@ class UltraOptimizedTrackEditor:
         if not (self.track_manager.tracks or self.image_cache):
             return
 
-        # Force stop first, then start if needed
         if self.playing:
             self.stop_playback()
             logger.debug("Playback stopped by user")
         else:
-            # Ensure we're really stopped before starting
             self.stop_playback()
             self.start_playback()
             logger.debug("Playback started by user")
@@ -2020,7 +2192,6 @@ class UltraOptimizedTrackEditor:
         if not (self.track_manager.tracks or self.image_cache):
             return
 
-        # Ensure clean state
         self.stop_playback()
 
         self.playing = True
@@ -2034,16 +2205,13 @@ class UltraOptimizedTrackEditor:
 
     def schedule_next_frame(self):
         """Schedule next frame with generation tracking and robust state checking"""
-        # Increment generation to invalidate any pending timers
         self._timer_generation += 1
         current_generation = self._timer_generation
-        
-        # Clear any existing timer first
+
         if self._playback_timer:
             self.root.after_cancel(self._playback_timer)
             self._playback_timer = None
-        
-        # Double-check playing state before proceeding
+
         if not self.playing:
             return
 
@@ -2062,16 +2230,13 @@ class UltraOptimizedTrackEditor:
 
         self.update_frame_display()
 
-        # Check again before scheduling - state might have changed during update
         if not self.playing:
             return
 
-        # Calculate delay and schedule next frame
         target_delay = int(1000 / self.fps)
         avg_frame_time = np.mean(self.frame_times) if self.frame_times else 0
         actual_delay = max(10, target_delay - int(avg_frame_time * 1000))
 
-        # Schedule with generation check
         def next_frame_with_check():
             if self.playing and self._timer_generation == current_generation:
                 self.schedule_next_frame()
@@ -2083,15 +2248,15 @@ class UltraOptimizedTrackEditor:
         was_playing = self.playing
         self.playing = False
         self._timer_generation += 1  # Invalidate all pending timers
-        
+
         # Cancel any pending playback timer
         if self._playback_timer:
             self.root.after_cancel(self._playback_timer)
             self._playback_timer = None
-        
+
         # Update button state
         self.play_button.config(text=">")
-        
+
         # Log for debugging
         if was_playing:
             logger.debug("Playback stopped - timer canceled")
@@ -2170,7 +2335,7 @@ class UltraOptimizedTrackEditor:
     def step_backward_10(self):
         self.goto_frame(self.current_frame - 10)
 
-    # ================== TRACK EDITING ==================
+    # ================== TRACK EDITING WITH FIXED SELECTION ==================
 
     def toggle_editing_mode(self):
         """Toggle editing mode"""
@@ -2180,118 +2345,101 @@ class UltraOptimizedTrackEditor:
             if self.track_manager.tracks:
                 self.track_manager.original_tracks = {k: v.copy() for k, v in self.track_manager.tracks.items()}
                 self.track_manager.deleted_tracks.clear()
-                self.selected_tracks.clear()
+                self.selection_manager.clear_selection("edit_mode")
 
             for btn in [self.delete_button, self.keep_button, self.merge_button,
                        self.split_button, self.save_edits_button]:
                 btn.config(state='normal')
-                
+
             self.selection_mode = True
         else:
             self.selection_mode = False
-            self.selected_tracks.clear()
+            self.selection_manager.clear_selection("edit_mode")
 
             for btn in [self.delete_button, self.keep_button, self.merge_button,
                        self.split_button, self.save_edits_button]:
                 btn.config(state='disabled')
 
-        self.update_selection_display()
         self.update_tracks_only()
-        self.update_track_list()
-
-    def update_selection_display(self):
-        """Update selection display"""
-        if self.selected_tracks:
-            selected_list = sorted(list(self.selected_tracks))
-            self.selected_tracks_label.config(
-                text=f"Selected: {selected_list[:5]}{'...' if len(selected_list) > 5 else ''} ({len(selected_list)} tracks)")
-        else:
-            self.selected_tracks_label.config(text="Selected: None")
-
-        # Enable split only when editing is on and exactly one track is selected
-        if hasattr(self, "split_button"):
-            if self.editing_enabled and len(self.selected_tracks) == 1:
-                self.split_button.config(state='normal')
-            else:
-                self.split_button.config(state='disabled')
+        self._update_track_list_display()
 
     def delete_selected_tracks(self):
         """Delete selected tracks"""
-        if not self.selected_tracks:
+        selected_tracks = self.selection_manager.get_selection()
+        if not selected_tracks:
             messagebox.showwarning("No Selection", "No tracks selected!")
             return
 
         confirm = messagebox.askyesno("Confirm Deletion",
-                                     f"Delete {len(self.selected_tracks)} tracks?")
+                                     f"Delete {len(selected_tracks)} tracks?")
 
         if confirm:
-            self.track_manager.delete_tracks(self.selected_tracks)
-            self.selected_tracks.clear()
+            self.track_manager.delete_tracks(selected_tracks)
+            self.selection_manager.clear_selection("delete")
             self.tracks_need_update = True
-            self.update_selection_display()
             self.update_frame_display(force_update=True)
-            self.update_track_list()
+            self._update_track_list_display()
 
     def keep_selected_tracks(self):
         """Keep only selected tracks"""
-        if not self.selected_tracks:
+        selected_tracks = self.selection_manager.get_selection()
+        if not selected_tracks:
             messagebox.showwarning("No Selection", "No tracks selected!")
             return
 
         all_track_ids = set(self.track_manager.tracks.keys()) - self.track_manager.deleted_tracks
-        tracks_to_delete = all_track_ids - self.selected_tracks
+        tracks_to_delete = all_track_ids - selected_tracks
 
         if not tracks_to_delete:
             messagebox.showinfo("No Action", "All existing tracks are already selected!")
             return
 
         confirm = messagebox.askyesno("Confirm Keep Selected",
-                                     f"Keep {len(self.selected_tracks)} selected tracks and "
+                                     f"Keep {len(selected_tracks)} selected tracks and "
                                      f"delete {len(tracks_to_delete)} others?")
 
         if confirm:
             self.track_manager.delete_tracks(tracks_to_delete)
-            self.selected_tracks.clear()
+            self.selection_manager.clear_selection("keep")
             self.tracks_need_update = True
-            self.update_selection_display()
             self.update_frame_display(force_update=True)
-            self.update_track_list()
+            self._update_track_list_display()
 
     def merge_selected_tracks(self):
         """Merge selected tracks with robust conflict resolution"""
-        if len(self.selected_tracks) < 2:
+        selected_tracks = self.selection_manager.get_selection()
+        if len(selected_tracks) < 2:
             messagebox.showwarning("Insufficient Selection", "Select at least 2 tracks!")
             return
 
-        selected_list = sorted(list(self.selected_tracks))
-        
-        # Show merge preview in the log
+        selected_list = sorted(list(selected_tracks))
+
         logger.info(f"USER: Attempting to merge tracks {selected_list}")
-        
+
         confirm = messagebox.askyesno("Confirm Merge",
                                      f"Merge {len(selected_list)} tracks into track {selected_list[0]}?\n\n"
                                      f"Check the console/log for detailed merge analysis.")
 
         if confirm:
             if self.track_manager.merge_tracks(selected_list):
-                self.selected_tracks.clear()
+                self.selection_manager.clear_selection("merge")
                 self.tracks_need_update = True
-                self.update_selection_display()
                 self.update_frame_display(force_update=True)
-                self.update_track_list()
-                messagebox.showinfo("Merge Complete", 
+                self._update_track_list_display()
+                messagebox.showinfo("Merge Complete",
                                    f"Successfully merged tracks. Check console for detailed merge report.")
             else:
-                messagebox.showerror("Merge Failed", 
+                messagebox.showerror("Merge Failed",
                                    "Merge failed. Check console for details.")
 
     def split_selected_track(self):
         """Split the single selected track at the current frame into two tracks."""
-        if not self.selected_tracks or len(self.selected_tracks) != 1:
+        selected_tracks = self.selection_manager.get_selection()
+        if not selected_tracks or len(selected_tracks) != 1:
             messagebox.showwarning("Split", "Select exactly one track to split.")
             return
 
-        track_id = next(iter(self.selected_tracks))
+        track_id = next(iter(selected_tracks))
 
         new_id = self.track_manager.split_track(track_id, self.current_frame)
         if new_id is None:
@@ -2299,13 +2447,12 @@ class UltraOptimizedTrackEditor:
             return
 
         # Keep both parts selected
-        self.selected_tracks = {track_id, new_id}
+        new_selection = {track_id, new_id}
+        self.selection_manager.update_selection(new_selection, "split")
         self.tracks_need_update = True
 
-        self.update_selection_display()
         self.update_frame_display(force_update=True)
-        self.update_track_list()
-        self._sync_listbox_selection()
+        self._update_track_list_display()
 
     def save_edited_tracks(self):
         """Save edited tracks"""
@@ -2392,11 +2539,18 @@ class UltraOptimizedTrackEditor:
 
         stats_text = f"""Performance Statistics:
 
+FIXED Selection System:
+- Centralized SelectionManager with debouncing
+- Enhanced track detection (current positions priority)
+- Canvas and listbox synchronization
+- Ctrl+click multi-select support
+- Stable 80/20 layout (no creeping)
+
 Persistent Object System:
 - Pre-rendered tracks: {prerendered_tracks}
 - Ultra-smooth scrolling with set_data() optimization
 - Global coordinate scaling: {self.image_cache.global_downsample_ratio:.3f}
-- Robust timer management with generation tracking
+- Robust timer management
 
 Cache Performance:
 - Hit Rate: {stats.hit_rate:.1f}%
@@ -2410,15 +2564,11 @@ Frame Rendering:
 - Max: {max_frame_time:.1f}ms
 - Target FPS: {self.fps}
 
-Merge System:
-- Intelligent conflict resolution enabled
-- Trajectory-based position selection
-- Detailed merge analysis and logging
-
 System:
 - Memory Usage: {memory_usage:.1f}MB
 - Total Images: {len(self.image_cache.image_files) if self.image_cache else 0}
-- Total Tracks: {len(self.track_manager.tracks) if self.track_manager.tracks else 0}"""
+- Total Tracks: {len(self.track_manager.tracks) if self.track_manager.tracks else 0}
+- Selected Tracks: {len(self.selection_manager.get_selection())}"""
 
         messagebox.showinfo("Performance Statistics", stats_text)
 
@@ -2433,9 +2583,11 @@ System:
             else:
                 actual_fps = 0
 
-            perf_text = (f"Cache: {stats.hit_rate:.1f}% hit | "
+            selected_count = len(self.selection_manager.get_selection())
+            perf_text = (f"Cache: {stats.hit_rate:.1f}% | "
                         f"FPS: {actual_fps:.1f} | "
-                        f"Persistent: {len(self.track_overlay.prerendered_tracks) if self.track_overlay else 0}")
+                        f"Tracks: {len(self.track_overlay.prerendered_tracks) if self.track_overlay else 0} | "
+                        f"Selected: {selected_count}")
 
             self.perf_label.config(text=perf_text)
             self.last_stats_update = time.time()
@@ -2481,7 +2633,7 @@ System:
     def run(self):
         """Start the application"""
         try:
-            logger.info("Starting SWT Track Editor with Persistent Object System...")
+            logger.info("Starting SWT Track Editor with Fixed Selection System...")
             self.root.mainloop()
         except KeyboardInterrupt:
             self.on_closing()
@@ -2494,7 +2646,7 @@ System:
 
 def main():
     """Main entry point with command line support"""
-    parser = argparse.ArgumentParser(description="SWT Track Editor - Persistent Object System")
+    parser = argparse.ArgumentParser(description="SWT Track Editor - Fixed Selection System")
     parser.add_argument("--csv", help="Path to track CSV to auto-load")
     parser.add_argument("--images", help="Path to image directory to auto-load")
     parser.add_argument("--cache-size", type=int, help="Override cache size")
@@ -2504,20 +2656,22 @@ def main():
 
     logging.getLogger().setLevel(getattr(logging, args.log_level))
 
-    logger.info("=== SWT Track Editor - Persistent Object System ===")
-    logger.info("Performance Optimizations:")
+    logger.info("=== SWT Track Editor - Fixed Selection System ===")
+    logger.info("Selection System Fixes:")
+    logger.info("✓ Centralized SelectionManager with single source of truth")
+    logger.info("✓ Event debouncing prevents race conditions")
+    logger.info("✓ Enhanced track detection prioritizes current positions")
+    logger.info("✓ Canvas and listbox selection synchronized")
+    logger.info("✓ Ctrl+click multi-select works from both sources")
+    logger.info("✓ Fixed layout stability (no creeping track list)")
+    logger.info("✓ exportselection=False prevents listbox focus issues")
+    logger.info("✓ Event source tracking prevents infinite loops")
+
+    logger.info("\nPerformance Features Maintained:")
     logger.info("✓ Persistent imshow object with set_data() updates")
-    logger.info("✓ Persistent track LineCollections with set_segments() updates")
-    logger.info("✓ No axis clearing during playback")
-    logger.info("✓ Global coordinate scaling applied once at load time")
-    logger.info("✓ LineCollection rebuild only on track edits")
-    logger.info("✓ All editing functionality preserved")
-    logger.info("✓ Dual selection: Canvas clicking AND scrollable list")
-    logger.info("✓ Robust timer management with generation tracking")
-    logger.info("✓ Race condition protection for selections")
-    logger.info("✓ Synchronized selection between canvas and list")
-    logger.info("✓ Ctrl+click support for multiple selection")
-    logger.info("✓ Optimized layout: 80% width for images/tracks")
+    logger.info("✓ Persistent LineCollections with set_segments() updates")
+    logger.info("✓ Global coordinate scaling applied once")
+    logger.info("✓ Robust timer management and merge system")
     logger.info("=" * 70)
 
     # Check for dependencies
