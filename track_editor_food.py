@@ -2,14 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-SWT Track Editor with Persistent Object Optimization and Fixed Selection System
+SWT Track Editor with Performance and Selection Fixes
 
-Key fixes:
-- Robust selection state management with single source of truth
-- Event debouncing to prevent race conditions
-- Improved track detection algorithm
-- Synchronized canvas and listbox selection
-- Layout stability fixes
+Key improvements:
+- Proper resource cleanup when loading new data
+- Fixed selection desync issues with retry logic
+- Sane memory management without performance-harming timed cleanup
+- Enhanced error handling and validation
+- Percentage-based memory monitoring with absolute safety limits
 """
 
 import cv2
@@ -46,14 +46,24 @@ logger = logging.getLogger(__name__)
 
 class Config:
     """Application configuration constants"""
-    DEFAULT_CACHE_SIZE = 100
+    DEFAULT_CACHE_SIZE = 500  # Increased for better performance
     DEFAULT_FPS = 15.0
     DEFAULT_TRAIL_LENGTH = 30
     MAX_DISPLAY_SIZE = (2048, 2048)
     SELECTION_RADIUS = 30
-    PREFETCH_RADIUS = 20
+    PREFETCH_RADIUS = 30
     PERFORMANCE_UPDATE_INTERVAL = 2000
-    SELECTION_DEBOUNCE_MS = 50
+    SELECTION_DEBOUNCE_MS = 100  # Increased from 50
+    MAX_RETRY_ATTEMPTS = 3
+
+    # Memory management - sane settings
+    MEMORY_WARNING_THRESHOLD = 0.6     # 60% of system memory
+    MEMORY_CRITICAL_THRESHOLD = 0.75   # 75% triggers cleanup
+    
+    # Absolute safety limits for modern systems
+    MAX_CACHE_MEMORY_GB = 8.0          # 8GB cache limit
+    MAX_CACHE_IMAGES = 1000            # 1000 images max
+    MAX_TOTAL_APP_MEMORY_GB = 16.0     # 16GB emergency limit
 
     # Threading
     MAX_BACKGROUND_WORKERS = 3
@@ -93,6 +103,7 @@ class CacheStats:
     warm_cache_size: int
     avg_load_time_ms: float
     queue_size: int
+    memory_usage_mb: float
 
 @dataclass
 class PrerenderedTrackData:
@@ -104,16 +115,17 @@ class PrerenderedTrackData:
     segment_frames: List[int]
     color: str
 
-# ================== SELECTION MANAGER ==================
+# ================== ENHANCED SELECTION MANAGER ==================
 
 class SelectionManager:
-    """Centralized selection state management with race condition protection"""
+    """Centralized selection state management with improved race condition protection"""
 
     def __init__(self, root):
         self.root = root
         self.selected_tracks: set = set()
         self._selection_lock = False
         self._pending_update = None
+        self._retry_count = 0
         self._callbacks = {
             'listbox': None,
             'canvas': None,
@@ -124,28 +136,51 @@ class SelectionManager:
         """Register update callbacks for different UI components"""
         self._callbacks[source] = callback
 
-    def update_selection(self, new_selection: set, source: str = "unknown"):
-        """Thread-safe selection update with debouncing"""
+    def update_selection(self, new_selection: set, source: str = "unknown") -> bool:
+        """Thread-safe selection update with enhanced debouncing and retry logic"""
         if self._selection_lock:
-            logger.debug(f"Selection update from {source} ignored - lock active")
-            return False
+            logger.debug(f"Selection update from {source} deferred - lock active")
+            # Schedule retry instead of dropping
+            if self._retry_count < Config.MAX_RETRY_ATTEMPTS:
+                self._retry_count += 1
+                self.root.after(
+                    50,  # Short retry delay
+                    lambda: self.update_selection(new_selection, source)
+                )
+                return False
+            else:
+                logger.warning(f"Selection update from {source} dropped after {Config.MAX_RETRY_ATTEMPTS} retries")
+                self._retry_count = 0
+                return False
 
         # Cancel pending update
         if self._pending_update:
             self.root.after_cancel(self._pending_update)
 
-        # Schedule debounced update
+        # Schedule debounced update with validation
         self._pending_update = self.root.after(
             Config.SELECTION_DEBOUNCE_MS,
-            lambda: self._apply_selection_update(new_selection, source)
+            lambda: self._apply_selection_update_with_validation(new_selection, source)
         )
         return True
 
-    def _apply_selection_update(self, new_selection: set, source: str):
-        """Apply the actual selection update"""
+    def _apply_selection_update_with_validation(self, new_selection: set, source: str):
+        """Apply selection update with validation and error recovery"""
         self._pending_update = None
+        self._retry_count = 0  # Reset retry counter on successful scheduling
 
         if self._selection_lock:
+            logger.debug(f"Selection update from {source} rescheduled - lock still active")
+            # Reschedule instead of dropping
+            self.root.after(
+                50,
+                lambda: self._apply_selection_update_with_validation(new_selection, source)
+            )
+            return
+
+        # Validate selection before applying
+        if not isinstance(new_selection, set):
+            logger.error(f"Invalid selection type from {source}: {type(new_selection)}")
             return
 
         old_selection = self.selected_tracks.copy()
@@ -154,19 +189,29 @@ class SelectionManager:
         if old_selection != self.selected_tracks:
             logger.debug(f"Selection changed from {source}: {sorted(self.selected_tracks)}")
             self._sync_all_displays(exclude_source=source)
+        else:
+            logger.debug(f"Selection unchanged from {source}")
 
     def _sync_all_displays(self, exclude_source: str):
-        """Synchronize all UI displays except the source"""
+        """Synchronize all UI displays except the source with enhanced error handling"""
         self._selection_lock = True
+        sync_errors = []
+        
         try:
             for callback_source, callback in self._callbacks.items():
                 if callback_source != exclude_source and callback:
                     try:
                         callback(self.selected_tracks)
                     except Exception as e:
-                        logger.error(f"Error syncing {callback_source}: {e}")
+                        error_msg = f"Error syncing {callback_source}: {e}"
+                        logger.error(error_msg)
+                        sync_errors.append(error_msg)
         finally:
             self._selection_lock = False
+            
+        # Report sync errors if any occurred
+        if sync_errors:
+            logger.warning(f"Selection sync completed with {len(sync_errors)} errors")
 
     def handle_track_click(self, track_id: int, ctrl_held: bool = False) -> bool:
         """Handle track selection logic (ctrl+click support)"""
@@ -191,6 +236,15 @@ class SelectionManager:
     def select_all(self, all_tracks: set, source: str = "manual"):
         """Select all tracks"""
         return self.update_selection(all_tracks, source)
+
+    def validate_selection(self, valid_track_ids: set) -> bool:
+        """Validate current selection against available tracks and clean invalid selections"""
+        invalid_tracks = self.selected_tracks - valid_track_ids
+        if invalid_tracks:
+            logger.info(f"Removing invalid track selections: {sorted(invalid_tracks)}")
+            self.selected_tracks = self.selected_tracks & valid_track_ids
+            return True
+        return False
 
 # ================== IMAGE LOADING SYSTEM ==================
 
@@ -302,10 +356,10 @@ class MultiFormatImageLoader:
 
         return img.astype(np.uint8)
 
-# ================== CACHING SYSTEM ==================
+# ================== ENHANCED CACHING SYSTEM ==================
 
 class LazyImageCache:
-    """Ultra-fast lazy image cache with multi-tier caching"""
+    """Ultra-fast lazy image cache with sane memory monitoring"""
 
     def __init__(self, image_files: List[str], cache_size: int = None):
         self.image_files = image_files
@@ -331,6 +385,10 @@ class LazyImageCache:
         self.hit_count = 0
         self.miss_count = 0
         self.load_times = deque(maxlen=100)
+
+        # Memory monitoring
+        self.last_memory_check = time.time()
+        self.memory_usage_history = deque(maxlen=50)
 
         # Calculate global downsample ratio from first image
         self._determine_global_scaling()
@@ -368,23 +426,39 @@ class LazyImageCache:
             self.global_downsample_ratio = 1.0
 
     def _calculate_optimal_cache_size(self, cache_size: int = None) -> int:
-        """Calculate optimal cache size based on available memory"""
+        """Calculate optimal cache size with absolute limits"""
         if cache_size is not None:
-            return cache_size
+            return min(cache_size, Config.MAX_CACHE_IMAGES)
 
         available_gb = psutil.virtual_memory().available / (1024**3)
         estimated_mb_per_image = 4
         max_memory_mb = available_gb * 1024 * 0.3
+
+        # Cap at 8GB for cache
+        max_memory_mb = min(max_memory_mb, Config.MAX_CACHE_MEMORY_GB * 1024)
+
         optimal_cache_size = int(max_memory_mb / estimated_mb_per_image)
 
-        return max(20, min(optimal_cache_size, len(self.image_files), 500))
+        return max(20, min(optimal_cache_size, len(self.image_files), Config.MAX_CACHE_IMAGES))
+
+    def _get_memory_percentage(self) -> float:
+        """Get current memory usage as percentage of total system memory"""
+        try:
+            memory_info = psutil.virtual_memory()
+            return memory_info.percent / 100.0  # Convert to decimal (0.0 to 1.0)
+        except Exception as e:
+            logger.debug(f"Memory check failed: {e}")
+            return 0.0
 
     def get_image(self, frame_idx: int, priority: int = 1) -> Optional[np.ndarray]:
-        """Get image with multi-tier caching"""
+        """Get image with multi-tier caching and memory monitoring"""
         if frame_idx < 0 or frame_idx >= len(self.image_files):
             return None
 
         start_time = time.time()
+
+        # Lightweight memory monitoring - only checks every 10 seconds
+        self._check_memory_usage()
 
         # Hot cache hit
         if frame_idx in self.hot_cache:
@@ -412,6 +486,66 @@ class LazyImageCache:
 
         return img
 
+    def _check_memory_usage(self):
+        """Lightweight memory monitoring - only act when genuinely needed"""
+        current_time = time.time()
+        if current_time - self.last_memory_check > 10.0:  # Check every 10 seconds max
+            try:
+                # Check both percentage and absolute usage
+                memory_percentage = self._get_memory_percentage()
+                process = psutil.Process()
+                app_memory_gb = process.memory_info().rss / (1024**3)
+                
+                # Only act if limits exceeded
+                if app_memory_gb > Config.MAX_TOTAL_APP_MEMORY_GB:
+                    logger.error(f"App using {app_memory_gb:.1f}GB - emergency cleanup")
+                    self._emergency_cleanup()
+                elif app_memory_gb > Config.MAX_CACHE_MEMORY_GB or memory_percentage > Config.MEMORY_CRITICAL_THRESHOLD:
+                    logger.warning(f"Memory pressure: {app_memory_gb:.1f}GB / {memory_percentage*100:.1f}%")
+                    self._smart_cleanup()
+                
+            except Exception as e:
+                logger.debug(f"Memory check failed: {e}")
+            
+            self.last_memory_check = current_time
+
+    def _smart_cleanup(self):
+        """Perform smart cleanup based on memory pressure"""
+        original_hot_size = len(self.hot_cache)
+        original_warm_size = len(self.warm_cache)
+        
+        # More conservative cleanup - keep 70% of hot cache
+        hot_limit = max(20, int(len(self.hot_cache) * 0.7))
+        while len(self.hot_cache) > hot_limit:
+            self.hot_cache.popitem(last=False)
+            
+        # Reduce warm cache by half instead of clearing entirely
+        warm_limit = max(10, int(len(self.warm_cache) * 0.5))
+        while len(self.warm_cache) > warm_limit:
+            self.warm_cache.popitem(last=False)
+        
+        # Only force GC if we actually freed significant memory
+        if (original_hot_size - len(self.hot_cache)) > 10:
+            gc.collect()
+        
+        logger.info(f"Smart cleanup: Hot cache {original_hot_size}→{len(self.hot_cache)}, "
+                   f"Warm cache {original_warm_size}→{len(self.warm_cache)}")
+
+    def _emergency_cleanup(self):
+        """Emergency cleanup when absolute limits exceeded"""
+        logger.warning("Emergency cleanup triggered - clearing most of cache")
+        
+        # Keep only last 20 images in hot cache
+        while len(self.hot_cache) > 20:
+            self.hot_cache.popitem(last=False)
+        
+        # Clear warm cache entirely
+        self.warm_cache.clear()
+        
+        # Force aggressive garbage collection
+        collected = gc.collect()
+        logger.warning(f"Emergency cleanup: kept 20 hot images, collected {collected} objects")
+
     def _load_image_immediate(self, frame_idx: int) -> Optional[np.ndarray]:
         """Load image immediately with processing"""
         try:
@@ -434,14 +568,23 @@ class LazyImageCache:
             return None
 
     def _add_to_hot_cache(self, frame_idx: int, img: np.ndarray):
-        """Add to hot cache with intelligent eviction"""
+        """Add to hot cache with absolute size limits"""
+        # Check if we're approaching absolute limits
+        if len(self.hot_cache) >= Config.MAX_CACHE_IMAGES * 0.7:  # 70% of max
+            logger.debug(f"Approaching cache limit ({len(self.hot_cache)} images)")
+        
         self.hot_cache[frame_idx] = img
 
+        # Use more conservative limit if approaching absolute max
         hot_limit = int(self.cache_size * Config.HOT_CACHE_RATIO)
+        absolute_limit = int(Config.MAX_CACHE_IMAGES * 0.7)  # 70% of absolute max
+        hot_limit = min(hot_limit, absolute_limit)
+        
         while len(self.hot_cache) > hot_limit:
             oldest_idx, oldest_img = self.hot_cache.popitem(last=False)
-            warm_limit = self.cache_size - len(self.hot_cache)
-
+            warm_limit = min(self.cache_size - len(self.hot_cache), 
+                            Config.MAX_CACHE_IMAGES - len(self.hot_cache))
+            
             if len(self.warm_cache) < warm_limit:
                 self.warm_cache[oldest_idx] = oldest_img
 
@@ -468,7 +611,7 @@ class LazyImageCache:
         threading.Thread(target=self._background_loader, daemon=True).start()
 
     def _background_loader(self):
-        """Background image loading worker"""
+        """Background image loading worker with enhanced cleanup"""
         while not self.is_shutdown:
             try:
                 priority, frame_idx = self.load_queue.get(timeout=1)
@@ -486,6 +629,8 @@ class LazyImageCache:
 
             except queue.Empty:
                 continue
+            except Exception as e:
+                logger.error(f"Background loader error: {e}")
 
     def get_display_extent(self) -> Optional[Tuple[List[float], Tuple[int, int]]]:
         """Get display extent using global scaling"""
@@ -508,31 +653,55 @@ class LazyImageCache:
                     break
 
     def get_cache_stats(self) -> CacheStats:
-        """Get cache performance statistics"""
+        """Get cache performance statistics with memory usage"""
         total_requests = self.hit_count + self.miss_count
         hit_rate = (self.hit_count / total_requests * 100) if total_requests > 0 else 0
         avg_load_time = np.mean(self.load_times) if self.load_times else 0
+        
+        # Get current memory usage
+        try:
+            memory_mb = psutil.Process().memory_info().rss / (1024**2)
+        except:
+            memory_mb = 0
 
         return CacheStats(
             hit_rate=hit_rate,
             hot_cache_size=len(self.hot_cache),
             warm_cache_size=len(self.warm_cache),
             avg_load_time_ms=avg_load_time * 1000,
-            queue_size=self.load_queue.qsize()
+            queue_size=self.load_queue.qsize(),
+            memory_usage_mb=memory_mb
         )
 
     def clear_cache(self):
-        """Clear all caches"""
+        """Clear all caches - lightweight version"""
+        logger.debug("Clearing image cache...")
         self.hot_cache.clear()
         self.warm_cache.clear()
-        gc.collect()
+        self.metadata_cache.clear()
+        
+        # Clear the load queue
+        try:
+            while not self.load_queue.empty():
+                self.load_queue.get_nowait()
+        except queue.Empty:
+            pass
+        
+        logger.debug("Image cache cleared")
 
     def shutdown(self):
-        """Clean shutdown"""
+        """Clean shutdown with enhanced cleanup"""
         logger.info("Shutting down image cache...")
         self.is_shutdown = True
-        self.executor.shutdown(wait=False)
+        
+        # Stop background workers
+        if hasattr(self, 'executor'):
+            self.executor.shutdown(wait=False)
+            
+        # Clear all caches
         self.clear_cache()
+        
+        logger.info("Image cache shutdown complete")
 
 # ================== TRACK MANAGEMENT ==================
 
@@ -994,7 +1163,7 @@ class TrackManager:
 # ================== ENHANCED TRACK OVERLAY SYSTEM ==================
 
 class PersistentTrackOverlay:
-    """Persistent track overlay system with improved track detection"""
+    """Persistent track overlay system with improved track detection and incremental updates"""
 
     def __init__(self, ax, canvas):
         self.ax = ax
@@ -1013,14 +1182,92 @@ class PersistentTrackOverlay:
 
         # Track state for updates
         self.tracks_need_update = True
+        self.last_update_time = 0
+
+    def clear_all_matplotlib_objects(self):
+        """Enhanced cleanup of matplotlib objects with detailed error handling"""
+        cleanup_count = 0
+        error_count = 0
+        
+        # Clear line collections with individual error handling
+        for track_id, collection in list(self.line_collections.items()):
+            try:
+                if collection.axes is not None:
+                    collection.remove()
+                cleanup_count += 1
+            except Exception as e:
+                logger.debug(f"Error removing line collection {track_id}: {e}")
+                error_count += 1
+        self.line_collections.clear()
+
+        # Clear full track collections
+        for track_id, collection in list(self.full_track_collections.items()):
+            try:
+                if collection.axes is not None:
+                    collection.remove()
+                cleanup_count += 1
+            except Exception as e:
+                logger.debug(f"Error removing full track collection {track_id}: {e}")
+                error_count += 1
+        self.full_track_collections.clear()
+
+        # Clear position scatter
+        if self.position_scatter:
+            try:
+                if hasattr(self.position_scatter, 'remove'):
+                    self.position_scatter.remove()
+                cleanup_count += 1
+            except Exception as e:
+                logger.debug(f"Error removing position scatter: {e}")
+                error_count += 1
+            self.position_scatter = None
+
+        # Clear label texts
+        for text in self.label_texts:
+            try:
+                if hasattr(text, 'remove'):
+                    text.remove()
+                cleanup_count += 1
+            except Exception as e:
+                logger.debug(f"Error removing label text: {e}")
+                error_count += 1
+        self.label_texts.clear()
+
+        # Clear mode indicators
+        for attr_name in ['coordinate_mode_text', 'selection_mode_text']:
+            text_obj = getattr(self, attr_name)
+            if text_obj:
+                try:
+                    if hasattr(text_obj, 'remove'):
+                        text_obj.remove()
+                    cleanup_count += 1
+                except Exception as e:
+                    logger.debug(f"Error removing {attr_name}: {e}")
+                    error_count += 1
+                setattr(self, attr_name, None)
+
+        if error_count > 0:
+            logger.warning(f"Cleanup completed with {error_count} errors, {cleanup_count} objects cleaned")
+        else:
+            logger.debug(f"Cleanup completed successfully, {cleanup_count} objects cleaned")
 
     def update_prerendered_tracks(self, track_manager: TrackManager, image_cache: Optional[LazyImageCache],
-                                 use_nose: bool = False):
-        """Pre-render complete tracks with global scaling applied once"""
-        logger.info("Pre-rendering tracks with global scaling...")
-        self.prerendered_tracks.clear()
-        self.line_collections.clear()
-        self.full_track_collections.clear()
+                                 use_nose: bool = False, incremental: bool = False):
+        """Pre-render tracks with validation to prevent accumulation"""
+        start_time = time.time()
+        
+        # Validation check - prevent runaway track counts
+        if len(track_manager.tracks) > 100:
+            logger.warning(f"Large number of tracks detected: {len(track_manager.tracks)}")
+        
+        # Clear old data if doing full update or if too many old tracks
+        if not incremental or len(self.prerendered_tracks) > len(track_manager.tracks) * 1.5:
+            logger.debug("Full track update - clearing old prerendered data")
+            self.clear_all_matplotlib_objects()
+            self.prerendered_tracks.clear()
+            incremental = False
+        else:
+            logger.debug("Incremental track update...")
 
         active_tracks = {k: v for k, v in track_manager.tracks.items()
                         if k not in track_manager.deleted_tracks}
@@ -1028,9 +1275,19 @@ class PersistentTrackOverlay:
         # Get global downsample ratio
         downsample_ratio = image_cache.global_downsample_ratio if image_cache else 1.0
 
+        # Track what needs updating
+        updated_tracks = 0
+        
         for track_id, positions in active_tracks.items():
             if not positions:
                 continue
+
+            # For incremental updates, skip tracks that haven't changed
+            if incremental and track_id in self.prerendered_tracks:
+                # Simple check: if position count is same, assume unchanged
+                existing_track = self.prerendered_tracks[track_id]
+                if len(existing_track.original_positions) == len(positions):
+                    continue
 
             # Filter positions based on coordinate type
             valid_positions = []
@@ -1042,6 +1299,22 @@ class PersistentTrackOverlay:
                     valid_positions.append(pos)
 
             if not valid_positions:
+                # Remove track if it becomes invalid
+                if track_id in self.prerendered_tracks:
+                    del self.prerendered_tracks[track_id]
+                    # Remove from collections too
+                    if track_id in self.line_collections:
+                        try:
+                            self.line_collections[track_id].remove()
+                        except:
+                            pass
+                        del self.line_collections[track_id]
+                    if track_id in self.full_track_collections:
+                        try:
+                            self.full_track_collections[track_id].remove()
+                        except:
+                            pass
+                        del self.full_track_collections[track_id]
                 continue
 
             # Convert to pre-scaled display coordinates
@@ -1081,41 +1354,75 @@ class PersistentTrackOverlay:
                 )
 
                 self.prerendered_tracks[track_id] = prerendered_track
+                updated_tracks += 1
 
-        logger.info(f"Pre-rendered {len(self.prerendered_tracks)} tracks with global scaling")
+        # Remove deleted tracks from prerendered data
+        for track_id in list(self.prerendered_tracks.keys()):
+            if track_id in track_manager.deleted_tracks or track_id not in active_tracks:
+                del self.prerendered_tracks[track_id]
+                # Remove from collections
+                if track_id in self.line_collections:
+                    try:
+                        self.line_collections[track_id].remove()
+                    except:
+                        pass
+                    del self.line_collections[track_id]
+                if track_id in self.full_track_collections:
+                    try:
+                        self.full_track_collections[track_id].remove()
+                    except:
+                        pass
+                    del self.full_track_collections[track_id]
+
+        update_time = time.time() - start_time
+        update_type = "Incremental" if incremental else "Full"
+        logger.info(f"{update_type} pre-rendering completed: {updated_tracks}/{len(active_tracks)} tracks updated in {update_time*1000:.1f}ms")
+        
         self.tracks_need_update = False
+        self.last_update_time = time.time()
 
     def add_persistent_collections_to_axis(self):
-        """Add all pre-rendered track collections to axis once"""
-        # Clear any existing collections
-        self.clear_all()
-
+        """Add all pre-rendered track collections to axis once with error handling"""
+        added_count = 0
+        error_count = 0
+        
         # Add all track collections to axis
         for track_id, prerendered_track in self.prerendered_tracks.items():
             if prerendered_track.line_segments:
-                # Create complete LineCollection for this track (for trails)
-                line_collection = LineCollection(
-                    prerendered_track.line_segments,
-                    colors=[prerendered_track.color],
-                    alpha=0.6,
-                    linewidths=1.5,
-                    zorder=1
-                )
+                try:
+                    # Create complete LineCollection for this track (for trails)
+                    line_collection = LineCollection(
+                        prerendered_track.line_segments,
+                        colors=[prerendered_track.color],
+                        alpha=0.6,
+                        linewidths=1.5,
+                        zorder=1
+                    )
 
-                # Create full track LineCollection (for full track display)
-                full_track_collection = LineCollection(
-                    prerendered_track.line_segments,
-                    colors=[prerendered_track.color],
-                    alpha=0.3,
-                    linewidths=1.0,
-                    zorder=0
-                )
+                    # Create full track LineCollection (for full track display)
+                    full_track_collection = LineCollection(
+                        prerendered_track.line_segments,
+                        colors=[prerendered_track.color],
+                        alpha=0.3,
+                        linewidths=1.0,
+                        zorder=0
+                    )
 
-                # Add to axis and store references
-                self.ax.add_collection(line_collection)
-                self.ax.add_collection(full_track_collection)
-                self.line_collections[track_id] = line_collection
-                self.full_track_collections[track_id] = full_track_collection
+                    # Add to axis and store references
+                    self.ax.add_collection(line_collection)
+                    self.ax.add_collection(full_track_collection)
+                    self.line_collections[track_id] = line_collection
+                    self.full_track_collections[track_id] = full_track_collection
+                    added_count += 1
+                    
+                except Exception as e:
+                    logger.error(f"Error adding collections for track {track_id}: {e}")
+                    error_count += 1
+
+        if error_count > 0:
+            logger.warning(f"Added {added_count} track collections with {error_count} errors")
+        else:
+            logger.debug(f"Added {added_count} track collections successfully")
 
     def update_visibility_only(self, current_frame: int, trail_length: int, use_nose: bool,
                               selected_tracks: set, show_trails: bool, show_labels: bool,
@@ -1370,59 +1677,20 @@ class PersistentTrackOverlay:
         return np.sqrt((px - closest_x)**2 + (py - closest_y)**2)
 
     def clear_all(self):
-        """Clear all rendered elements"""
-        for collection in self.line_collections.values():
-            try:
-                collection.remove()
-            except:
-                pass
-        self.line_collections.clear()
+        """Clear all rendered elements using enhanced cleanup"""
+        self.clear_all_matplotlib_objects()
+        self.prerendered_tracks.clear()
 
-        for collection in self.full_track_collections.values():
-            try:
-                collection.remove()
-            except:
-                pass
-        self.full_track_collections.clear()
-
-        if self.position_scatter:
-            try:
-                self.position_scatter.remove()
-            except:
-                pass
-            self.position_scatter = None
-
-        for text in self.label_texts:
-            try:
-                text.remove()
-            except:
-                pass
-        self.label_texts.clear()
-
-        if self.coordinate_mode_text:
-            try:
-                self.coordinate_mode_text.remove()
-            except:
-                pass
-            self.coordinate_mode_text = None
-
-        if self.selection_mode_text:
-            try:
-                self.selection_mode_text.remove()
-            except:
-                pass
-            self.selection_mode_text = None
-
-# ================== MAIN APPLICATION ==================
+# ================== MAIN APPLICATION WITH FIXES ==================
 
 class UltraOptimizedTrackEditor:
-    """Main application with fixed selection system and persistent object optimization"""
+    """Main application with fixed selection system, performance improvements, and resource cleanup"""
 
     def __init__(self):
         # Core components
         self.image_cache: Optional[LazyImageCache] = None
-        self.track_manager = TrackManager()
         self.track_overlay: Optional[PersistentTrackOverlay] = None
+        self.track_manager = TrackManager()
 
         # Create root window first
         self.root = tk.Tk()
@@ -1480,7 +1748,15 @@ class UltraOptimizedTrackEditor:
         self.selection_manager.register_callback('ui', self._sync_ui_selection)
 
     def _sync_listbox_selection(self, selected_tracks: set):
-        """Sync listbox with selection (called by selection manager)"""
+        """Sync listbox with selection (called by selection manager) with improved timing"""
+        try:
+            # Use after_idle to ensure listbox is ready
+            self.root.after_idle(lambda: self._do_listbox_sync(selected_tracks))
+        except Exception as e:
+            logger.error(f"Error scheduling listbox sync: {e}")
+
+    def _do_listbox_sync(self, selected_tracks: set):
+        """Perform the actual listbox synchronization"""
         try:
             # Clear current listbox selection
             self.track_listbox.selection_clear(0, tk.END)
@@ -1495,7 +1771,7 @@ class UltraOptimizedTrackEditor:
             # Update track list display
             self._update_track_list_display()
         except Exception as e:
-            logger.error(f"Error syncing listbox selection: {e}")
+            logger.error(f"Error in listbox sync: {e}")
 
     def _sync_canvas_selection(self, selected_tracks: set):
         """Sync canvas display with selection (called by selection manager)"""
@@ -1528,7 +1804,7 @@ class UltraOptimizedTrackEditor:
 
     def setup_gui(self):
         """Initialize GUI with fixed layout"""
-        self.root.title("SWT Track Editor - Fixed Selection System")
+        self.root.title("SWT Track Editor - Performance & Selection Fixed")
         self.root.geometry("1600x1000")
         self.root.minsize(1400, 800)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -1803,27 +2079,32 @@ class UltraOptimizedTrackEditor:
     # ================== ENHANCED SELECTION HANDLING ==================
 
     def on_track_list_select(self, event):
-        """Handle track list selection with proper debouncing"""
+        """Handle track list selection with improved debouncing"""
         if not self.editing_enabled:
             return
 
-        # Get selected indices
+        # Use after_idle to ensure listbox state is fully updated
+        self.root.after_idle(self._handle_track_list_selection)
+
+    def _handle_track_list_selection(self):
+        """Handle track list selection with proper timing"""
         try:
+            # Get selected indices
             selected_indices = self.track_listbox.curselection()
-        except:
-            return
 
-        # Convert indices to track IDs
-        new_selection = set()
-        if self.track_manager.tracks:
-            track_ids = sorted(self.track_manager.get_all_track_ids())
-            for idx in selected_indices:
-                if idx < len(track_ids):
-                    track_id = track_ids[idx]
-                    new_selection.add(track_id)
+            # Convert indices to track IDs
+            new_selection = set()
+            if self.track_manager.tracks:
+                track_ids = sorted(self.track_manager.get_all_track_ids())
+                for idx in selected_indices:
+                    if idx < len(track_ids):
+                        track_id = track_ids[idx]
+                        new_selection.add(track_id)
 
-        # Update selection through manager
-        self.selection_manager.update_selection(new_selection, "listbox")
+            # Update selection through manager
+            self.selection_manager.update_selection(new_selection, "listbox")
+        except Exception as e:
+            logger.error(f"Error handling track list selection: {e}")
 
     def on_canvas_click(self, event):
         """Handle canvas clicks for track selection with enhanced detection"""
@@ -1861,7 +2142,7 @@ class UltraOptimizedTrackEditor:
         self.tracks_need_update = True
         self.update_frame_display(force_update=True)
 
-    # ================== FILE LOADING ==================
+    # ================== ENHANCED FILE LOADING ==================
 
     def load_track_csv(self):
         """Load track CSV file"""
@@ -1876,13 +2157,23 @@ class UltraOptimizedTrackEditor:
         self.load_csv_from_path(file_path)
 
     def load_csv_from_path(self, file_path: str) -> bool:
-        """Load CSV from path"""
+        """Load CSV from path with enhanced cleanup"""
         try:
             logger.info(f"Loading CSV: {file_path}")
+            
+            # Cleanup existing resources before loading
+            self._cleanup_before_new_data()
+            
             df = pd.read_csv(file_path)
 
             if self.track_manager.load_from_dataframe(df):
                 self.tracks_need_update = True
+                
+                # Validate and clean selection
+                valid_track_ids = set(self.track_manager.get_all_track_ids())
+                if self.selection_manager.validate_selection(valid_track_ids):
+                    logger.info("Cleaned invalid track selections after CSV load")
+                
                 self.update_interface_after_load()
                 nose_status = " (with nose data)" if self.track_manager.has_nose_data else ""
                 self.status_label.config(text=f"Tracks: {len(self.track_manager.tracks)} loaded{nose_status}")
@@ -1914,13 +2205,19 @@ class UltraOptimizedTrackEditor:
         self.load_images_from_dir(directory)
 
     def load_images_from_dir(self, directory: str) -> bool:
-        """Load images from directory"""
+        """Load images from directory with enhanced cleanup and validation"""
         try:
             if not os.path.isdir(directory):
                 messagebox.showerror("Error", f"Not a directory: {directory}")
                 return False
 
             logger.info("Scanning for images...")
+            
+            # Cleanup existing image cache
+            if self.image_cache:
+                self.image_cache.shutdown()
+                self.image_cache = None
+                
             image_extensions = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp', '.webp'}
 
             image_files = [
@@ -1930,10 +2227,16 @@ class UltraOptimizedTrackEditor:
             ]
 
             if image_files:
+                # Validate reasonable image count
+                if len(image_files) > 10000:
+                    response = messagebox.askyesno(
+                        "Large Dataset", 
+                        f"Found {len(image_files)} images. This may use significant memory. Continue?"
+                    )
+                    if not response:
+                        return False
+                
                 logger.info(f"Creating cache for {len(image_files)} images...")
-
-                if self.image_cache:
-                    self.image_cache.shutdown()
 
                 self.image_cache = LazyImageCache(image_files)
                 self.image_cache.prefetch_range(0, min(10, len(image_files)), priority=1)
@@ -1949,6 +2252,50 @@ class UltraOptimizedTrackEditor:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load images: {str(e)}")
             return False
+
+    def _cleanup_before_new_data(self):
+        """Enhanced cleanup with error recovery"""
+        logger.debug("Cleaning up resources before loading new data...")
+        
+        # Stop all active operations first
+        if self.playing:
+            self.stop_playback()
+        
+        # Clear selection (prevents orphaned selections)
+        self.selection_manager.clear_selection("cleanup")
+        
+        # Aggressive matplotlib cleanup with error recovery
+        if self.track_overlay:
+            try:
+                self.track_overlay.clear_all()
+            except Exception as e:
+                logger.warning(f"Track overlay cleanup failed: {e}")
+                # Force recreate track overlay if cleanup fails
+                self.track_overlay = PersistentTrackOverlay(self.viewer_ax, self.viewer_canvas)
+        
+        # Clear background with recovery
+        if hasattr(self, '_background_imshow') and self._background_imshow:
+            try:
+                self._background_imshow.remove()
+            except Exception as e:
+                logger.debug(f"Background image removal failed: {e}")
+            finally:
+                self._background_imshow = None
+        
+        # Shutdown image cache completely (prevents thread conflicts)
+        if self.image_cache:
+            try:
+                self.image_cache.shutdown()
+            except Exception as e:
+                logger.warning(f"Image cache shutdown failed: {e}")
+            finally:
+                self.image_cache = None
+        
+        # Reset state flags
+        self.tracks_need_update = True
+        self.last_displayed_frame = -1
+        
+        logger.debug("Resource cleanup completed")
 
     def update_interface_after_load(self):
         """Update interface after loading data"""
@@ -1969,7 +2316,7 @@ class UltraOptimizedTrackEditor:
         self._background_imshow = None
         self.update_frame_display(force_update=True)
 
-    # ================== OPTIMIZED UPDATE HANDLING ==================
+    # ================== ENHANCED UPDATE HANDLING ==================
 
     def update_frame_display(self, force_update=False):
         """Update frame display with improved race condition protection"""
@@ -1987,14 +2334,20 @@ class UltraOptimizedTrackEditor:
 
             frame_start_time = time.time()
 
-            # Update pre-rendered tracks if needed (only on track edits)
+            # Update pre-rendered tracks if needed (with incremental option)
             if self.tracks_need_update and self.track_overlay and self.track_manager.tracks:
+                # Use incremental update for small changes, full update for major changes
+                incremental = not force_update and hasattr(self.track_overlay, 'last_update_time')
+                
                 self.track_overlay.update_prerendered_tracks(
-                    self.track_manager, self.image_cache, self.use_nose_coordinates
+                    self.track_manager, self.image_cache, 
+                    self.use_nose_coordinates, incremental=incremental
                 )
                 self.tracks_need_update = False
-                # Force axis setup since tracks changed
-                self._setup_persistent_axis()
+                
+                # Force axis setup if doing full update
+                if not incremental:
+                    self._setup_persistent_axis()
 
             # Check if we need to update display
             if not force_update and self.current_frame == self.last_displayed_frame:
@@ -2138,7 +2491,7 @@ class UltraOptimizedTrackEditor:
             self.track_overlay.add_persistent_collections_to_axis()
 
         # Set title and labels
-        title = f"SWT Track Editor - Fixed Selection System"
+        title = f"SWT Track Editor - Performance & Selection Fixed"
         if self.use_nose_coordinates:
             title += " (Nose Coordinates)"
 
@@ -2534,14 +2887,15 @@ class UltraOptimizedTrackEditor:
         else:
             avg_frame_time = max_frame_time = min_frame_time = 0
 
-        memory_usage = psutil.Process().memory_info().rss / (1024**2)
         prerendered_tracks = len(self.track_overlay.prerendered_tracks) if self.track_overlay else 0
+        memory_percentage = self.image_cache._get_memory_percentage() if self.image_cache else 0
 
         stats_text = f"""Performance Statistics:
 
-FIXED Selection System:
-- Centralized SelectionManager with debouncing
-- Enhanced track detection (current positions priority)
+FIXED Selection & Performance Systems:
+- Enhanced SelectionManager with retry logic
+- Sane memory management (no timed cleanup)
+- Enhanced track detection (current positions priority)  
 - Canvas and listbox synchronization
 - Ctrl+click multi-select support
 - Stable 80/20 layout (no creeping)
@@ -2550,13 +2904,14 @@ Persistent Object System:
 - Pre-rendered tracks: {prerendered_tracks}
 - Ultra-smooth scrolling with set_data() optimization
 - Global coordinate scaling: {self.image_cache.global_downsample_ratio:.3f}
-- Robust timer management
+- Robust timer management with generation tracking
 
 Cache Performance:
 - Hit Rate: {stats.hit_rate:.1f}%
 - Hot Cache: {stats.hot_cache_size} images
 - Warm Cache: {stats.warm_cache_size} images
 - Load Queue: {stats.queue_size} pending
+- Memory Usage: {stats.memory_usage_mb:.1f}MB ({memory_percentage*100:.1f}% of system)
 
 Frame Rendering:
 - Average: {avg_frame_time:.1f}ms
@@ -2564,18 +2919,28 @@ Frame Rendering:
 - Max: {max_frame_time:.1f}ms
 - Target FPS: {self.fps}
 
+Selection System:
+- Debounce Delay: {Config.SELECTION_DEBOUNCE_MS}ms
+- Max Retries: {Config.MAX_RETRY_ATTEMPTS}
+- Selected Tracks: {len(self.selection_manager.get_selection())}
+
+Memory Limits:
+- Cache Memory: {Config.MAX_CACHE_MEMORY_GB}GB max
+- Cache Images: {Config.MAX_CACHE_IMAGES} max
+- App Memory: {Config.MAX_TOTAL_APP_MEMORY_GB}GB emergency limit
+
 System:
-- Memory Usage: {memory_usage:.1f}MB
 - Total Images: {len(self.image_cache.image_files) if self.image_cache else 0}
 - Total Tracks: {len(self.track_manager.tracks) if self.track_manager.tracks else 0}
-- Selected Tracks: {len(self.selection_manager.get_selection())}"""
+- Active Tracks: {len(self.track_manager.get_all_track_ids())}"""
 
         messagebox.showinfo("Performance Statistics", stats_text)
 
     def update_performance_stats(self):
-        """Update performance display"""
-        if self.image_cache and time.time() - self.last_stats_update > 2.0:
+        """Update performance display with enhanced monitoring"""
+        if self.image_cache and time.time() - self.last_stats_update > 3.0:
             stats = self.image_cache.get_cache_stats()
+            memory_percentage = self.image_cache._get_memory_percentage()
 
             if len(self.frame_times) > 10:
                 avg_frame_time = np.mean(self.frame_times)
@@ -2584,10 +2949,25 @@ System:
                 actual_fps = 0
 
             selected_count = len(self.selection_manager.get_selection())
+        
+            # Color code memory percentage in display
+            mem_color = ""
+            if memory_percentage > Config.MEMORY_CRITICAL_THRESHOLD:
+                mem_color = "⚠️"
+            elif memory_percentage > Config.MEMORY_WARNING_THRESHOLD:
+                mem_color = "⚡"
+        
+        # ADD THIS DIAGNOSTIC CODE HERE:
+            import sys
+            total_objects = len(gc.get_objects())
+            matplotlib_children = len(self.viewer_ax.get_children()) if hasattr(self, 'viewer_ax') else 0
+        
             perf_text = (f"Cache: {stats.hit_rate:.1f}% | "
-                        f"FPS: {actual_fps:.1f} | "
-                        f"Tracks: {len(self.track_overlay.prerendered_tracks) if self.track_overlay else 0} | "
-                        f"Selected: {selected_count}")
+                    f"FPS: {actual_fps:.1f} | "
+                    f"Tracks: {len(self.track_overlay.prerendered_tracks) if self.track_overlay else 0} | "
+                    f"Selected: {selected_count} | "
+                    f"Mem: {memory_percentage*100:.0f}%{mem_color} | "
+                    f"Obj: {total_objects} | MPL: {matplotlib_children}")
 
             self.perf_label.config(text=perf_text)
             self.last_stats_update = time.time()
@@ -2595,33 +2975,48 @@ System:
         self.root.after(Config.PERFORMANCE_UPDATE_INTERVAL, self.update_performance_stats)
 
     def on_closing(self):
-        """Clean shutdown with timer cleanup"""
+        """Clean shutdown with enhanced cleanup"""
         logger.info("Shutting down SWT Track Editor...")
 
         self.playing = False
         self._timer_generation += 1  # Invalidate all timers
 
-        # Cancel all pending timers
-        if self._playback_timer:
-            self.root.after_cancel(self._playback_timer)
-            self._playback_timer = None
+        # Cancel only the timers we actually use
+        for timer_attr in ['_playback_timer', '_slider_timer']:
+            timer = getattr(self, timer_attr, None)
+    def on_closing(self):
+        """Clean shutdown with enhanced cleanup"""
+        logger.info("Shutting down SWT Track Editor...")
 
-        if self._slider_timer:
-            self.root.after_cancel(self._slider_timer)
-            self._slider_timer = None
+        self.playing = False
+        self._timer_generation += 1  # Invalidate all timers
 
+        # Cancel only the timers we actually use
+        for timer_attr in ['_playback_timer', '_slider_timer']:
+            timer = getattr(self, timer_attr, None)
+            if timer:
+                try:
+                    self.root.after_cancel(timer)
+                except:
+                    pass
+                setattr(self, timer_attr, None)
+
+        # Clear track overlay with enhanced cleanup
         if self.track_overlay:
             self.track_overlay.clear_all()
 
+        # Shutdown image cache
         if self.image_cache:
             self.image_cache.shutdown()
 
+        # Close matplotlib figure
         if self.viewer_fig:
             try:
                 plt.close(self.viewer_fig)
             except:
                 pass
 
+        # Force final garbage collection
         gc.collect()
 
         try:
@@ -2633,7 +3028,7 @@ System:
     def run(self):
         """Start the application"""
         try:
-            logger.info("Starting SWT Track Editor with Fixed Selection System...")
+            logger.info("Starting SWT Track Editor with Performance & Selection Fixes...")
             self.root.mainloop()
         except KeyboardInterrupt:
             self.on_closing()
@@ -2646,7 +3041,7 @@ System:
 
 def main():
     """Main entry point with command line support"""
-    parser = argparse.ArgumentParser(description="SWT Track Editor - Fixed Selection System")
+    parser = argparse.ArgumentParser(description="SWT Track Editor - Performance & Selection Fixed")
     parser.add_argument("--csv", help="Path to track CSV to auto-load")
     parser.add_argument("--images", help="Path to image directory to auto-load")
     parser.add_argument("--cache-size", type=int, help="Override cache size")
@@ -2656,17 +3051,29 @@ def main():
 
     logging.getLogger().setLevel(getattr(logging, args.log_level))
 
-    logger.info("=== SWT Track Editor - Fixed Selection System ===")
-    logger.info("Selection System Fixes:")
-    logger.info("✓ Centralized SelectionManager with single source of truth")
-    logger.info("✓ Event debouncing prevents race conditions")
-    logger.info("✓ Enhanced track detection prioritizes current positions")
-    logger.info("✓ Canvas and listbox selection synchronized")
-    logger.info("✓ Ctrl+click multi-select works from both sources")
-    logger.info("✓ Fixed layout stability (no creeping track list)")
-    logger.info("✓ exportselection=False prevents listbox focus issues")
-    logger.info("✓ Event source tracking prevents infinite loops")
-
+    logger.info("=== SWT Track Editor - Performance & Selection Fixed ===")
+    logger.info("Performance Improvements:")
+    logger.info("✓ Enhanced resource cleanup when loading new data")
+    logger.info("✓ Proper matplotlib object removal with error handling")
+    logger.info("✓ Sane memory management without timed cleanup interference")
+    logger.info("✓ Percentage-based memory monitoring with absolute safety limits")
+    logger.info("✓ Background thread cleanup and conflict prevention")
+    
+    logger.info("\nSelection System Fixes:")
+    logger.info("✓ Improved debouncing with retry logic (100ms + retries)")
+    logger.info("✓ Enhanced SelectionManager with validation")
+    logger.info("✓ Proper timing for listbox updates using after_idle()")
+    logger.info("✓ Selection state validation after data changes")
+    logger.info("✓ Better error handling and recovery")
+    logger.info("✓ Fixed race conditions in selection events")
+    
+    logger.info("\nMemory Management:")
+    logger.info(f"✓ Cache size: {Config.DEFAULT_CACHE_SIZE} images")
+    logger.info(f"✓ Memory warning at {Config.MEMORY_WARNING_THRESHOLD*100:.0f}% system usage")
+    logger.info(f"✓ Memory cleanup at {Config.MEMORY_CRITICAL_THRESHOLD*100:.0f}% system usage")
+    logger.info(f"✓ Absolute limits: {Config.MAX_CACHE_MEMORY_GB}GB cache, {Config.MAX_TOTAL_APP_MEMORY_GB}GB total")
+    logger.info(f"✓ Cache image limit: {Config.MAX_CACHE_IMAGES} images maximum")
+    
     logger.info("\nPerformance Features Maintained:")
     logger.info("✓ Persistent imshow object with set_data() updates")
     logger.info("✓ Persistent LineCollections with set_segments() updates")
@@ -2720,4 +3127,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()        
