@@ -766,42 +766,100 @@ class BatchWormTracker:
         unassigned_detections = [d for d in range(len(detections)) if d not in assigned_detections]
         return assignments, unassigned_detections
 
-    def detect_nose(self, contour: np.ndarray, prev_nose: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
-        """Detect worm nose (most elongated point)"""
-        if len(contour) < 5:
+    def calculate_locomotion_direction(self, track: List[Dict]) -> Optional[Tuple[float, float]]:
+        """Calculate locomotion direction from recent positions (trajectory-based)"""
+        min_required_positions = max(2, self.config.nose_smoothing_frames)
+        if len(track) < min_required_positions:
+            return None
+
+        recent_positions = track[-min(self.config.nose_smoothing_frames, len(track)):]
+
+        if len(recent_positions) < 2:
+            return None
+
+        velocities = []
+        for i in range(1, len(recent_positions)):
+            prev_det = recent_positions[i-1]
+            curr_det = recent_positions[i]
+            
+            prev_x, prev_y = prev_det['centroid']
+            curr_x, curr_y = curr_det['centroid']
+            prev_f = prev_det['frame_idx']
+            curr_f = curr_det['frame_idx']
+
+            frame_diff = curr_f - prev_f
+            if frame_diff > 5:
+                continue
+
+            if frame_diff > 0:
+                raw_distance = np.sqrt((curr_x - prev_x)**2 + (curr_y - prev_y)**2)
+                distance_per_frame = raw_distance / frame_diff
+
+                if distance_per_frame >= self.config.min_movement_threshold:
+                    vx = (curr_x - prev_x) / frame_diff
+                    vy = (curr_y - prev_y) / frame_diff
+                    velocities.append((vx, vy))
+
+        if not velocities:
+            return None
+
+        avg_vx = np.mean([v[0] for v in velocities])
+        avg_vy = np.mean([v[1] for v in velocities])
+
+        direction_magnitude = np.sqrt(avg_vx**2 + avg_vy**2)
+        if direction_magnitude < 0.1:
+            return None
+
+        normalized_direction = (avg_vx / direction_magnitude, avg_vy / direction_magnitude)
+        return normalized_direction
+
+    def find_nose_position(self, contour: np.ndarray, locomotion_direction: Tuple[float, float]) -> Optional[Tuple[float, float]]:
+        """Find nose position with sub-pixel precision using locomotion direction"""
+        if contour is None or len(contour) < 3 or locomotion_direction is None:
             return None
 
         try:
-            ellipse = cv2.fitEllipse(contour)
-            center, (MA, ma), angle = ellipse
+            points = contour.reshape(-1, 2).astype(np.float64)
+            direction_vector = np.array(locomotion_direction, dtype=np.float64)
+            projections = np.dot(points, direction_vector)
 
-            if MA < 1e-6:
+            max_projection = np.max(projections)
+            projection_tolerance = 1.0
+            front_mask = projections >= (max_projection - projection_tolerance)
+            front_points = points[front_mask]
+
+            if len(front_points) == 0:
                 return None
 
-            angle_rad = np.deg2rad(angle)
-            direction = np.array([np.cos(angle_rad), np.sin(angle_rad)])
+            nose_x = np.mean(front_points[:, 0])
+            nose_y = np.mean(front_points[:, 1])
 
-            contour_points = contour.reshape(-1, 2).astype(np.float32)
-            center_np = np.array(center, dtype=np.float32)
-            projections = np.dot(contour_points - center_np, direction)
-
-            max_idx = np.argmax(projections)
-            min_idx = np.argmin(projections)
-
-            candidate_nose_pos = contour_points[max_idx]
-            candidate_tail_pos = contour_points[min_idx]
-
-            if prev_nose is not None:
-                dist_to_nose = np.linalg.norm(candidate_nose_pos - prev_nose)
-                dist_to_tail = np.linalg.norm(candidate_tail_pos - prev_nose)
-
-                if dist_to_tail < dist_to_nose:
-                    candidate_nose_pos, candidate_tail_pos = candidate_tail_pos, candidate_nose_pos
-
-            return candidate_nose_pos
+            return (round(float(nose_x), 4), round(float(nose_y), 4))
 
         except Exception as e:
+            self.logger.error(f"Error in find_nose_position: {e}")
             return None
+
+    def detect_nose_for_track(self, track: List[Dict]) -> Optional[Tuple[float, float]]:
+        """Detect nose position for a specific track using its trajectory"""
+        if not self.config.nose_detection_enabled:
+            return None
+
+        if len(track) < 2:
+            return None
+
+        locomotion_direction = self.calculate_locomotion_direction(track)
+        if locomotion_direction is None:
+            return None
+
+        # Get the contour from the most recent detection
+        last_det = track[-1]
+        if 'contour' not in last_det:
+            return None
+
+        contour = last_det['contour']
+        nose_position = self.find_nose_position(contour, locomotion_direction)
+        return nose_position
 
     def smooth_nose_positions(self, track: List[Dict]) -> List[Dict]:
         """Apply smoothing to nose positions"""
@@ -962,17 +1020,6 @@ class BatchWormTracker:
                 for det in detections:
                     det['frame_idx'] = frame_idx
 
-                    if self.config.nose_detection_enabled and 'contour' in det:
-                        prev_nose = None
-                        if active_tracks:
-                            for track in active_tracks:
-                                if track and 'nose_smoothed' in track[-1]:
-                                    prev_nose = track[-1]['nose_smoothed']
-                                    break
-
-                        nose_pos = self.detect_nose(det['contour'], prev_nose)
-                        det['nose'] = nose_pos
-
                 # Match detections to tracks
                 if self.config.use_hungarian:
                     assignments, unassigned = self.match_detections_hungarian(
@@ -983,9 +1030,15 @@ class BatchWormTracker:
                         active_tracks, detections, frame_idx
                     )
 
-                # Update existing tracks
+                # Update existing tracks and detect nose positions
                 for track_idx, det_idx in assignments:
                     active_tracks[track_idx].append(detections[det_idx])
+                    
+                    # Detect nose position using track's trajectory
+                    if self.config.nose_detection_enabled:
+                        nose_pos = self.detect_nose_for_track(active_tracks[track_idx])
+                        if nose_pos is not None:
+                            active_tracks[track_idx][-1]['nose'] = nose_pos
 
                 # Create new tracks
                 for det_idx in unassigned:
