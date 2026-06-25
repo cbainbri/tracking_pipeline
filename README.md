@@ -41,7 +41,7 @@ Use the track editors to manually correct tracking errors after the batch run:
 
 ## Output
 
-Batch trackers produce wide-format CSVs (one row per frame, one column group per worm). These are the input files for the downstream analysis repos (`food_encounter_analysis`, `opto_analysis`).
+Batch trackers produce wide-format CSVs (one row per frame, one column group per worm). These are the input files for the downstream analysis repos ([food_encounter_analysis](https://github.com/cbainbri/food_encounter_analysis), [opto_analysis](https://github.com/cbainbri/opto_analysis)).
 
 ## Installation
 
