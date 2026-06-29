@@ -160,6 +160,9 @@ elif IS_LINUX and _gpu_vendor == "nvidia":
     _try_cupy() or _try_torch_cuda()
 elif IS_LINUX and _gpu_vendor == "amd":
     _try_torch_rocm()
+elif IS_LINUX and _gpu_vendor == "unknown":
+    # OpenCL ICD unavailable (common in conda envs) — try PyTorch directly
+    _try_torch_rocm() or _try_cupy() or _try_torch_cuda()
 # else: stays "cpu"
 
 
