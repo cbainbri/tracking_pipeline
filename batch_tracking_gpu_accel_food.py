@@ -198,6 +198,10 @@ def _numpy_process_frame(frame: np.ndarray, cpu_bg: np.ndarray, lo: int, hi: int
     diff = cv2.absdiff(cpu_bg, frame)
     return cv2.inRange(diff, lo, hi)
 
+def _numpy_process_batch(frames: np.ndarray, cpu_bg: np.ndarray, lo: int, hi: int) -> np.ndarray:
+    diff = np.abs(cpu_bg[np.newaxis].astype(np.int16) - frames.astype(np.int16)).astype(np.uint8)
+    return ((diff >= lo) & (diff <= hi)).astype(np.uint8) * 255
+
 def _numpy_release_background(_bg) -> None:
     pass
 
@@ -243,6 +247,16 @@ def _cupy_process_frame(frame: np.ndarray, gpu_bg, lo: int, hi: int) -> np.ndarr
     mask = ((diff >= lo) & (diff <= hi)).astype(cp.uint8) * 255
     result = cp.asnumpy(mask)
     del gpu_frame, diff, mask
+    return result
+
+def _cupy_process_batch(frames: np.ndarray, gpu_bg, lo: int, hi: int) -> np.ndarray:
+    import cupy as cp
+    gpu_frames = cp.asarray(frames, dtype=cp.int16)
+    diff = cp.abs(gpu_bg[cp.newaxis] - gpu_frames).astype(cp.uint8)
+    masks = ((diff >= lo) & (diff <= hi)).astype(cp.uint8) * 255
+    result = cp.asnumpy(masks)
+    del gpu_frames, diff, masks
+    cp.get_default_memory_pool().free_all_blocks()
     return result
 
 def _cupy_release_background(gpu_bg) -> None:
@@ -299,6 +313,17 @@ def _torch_process_frame(frame: np.ndarray, gpu_bg, lo: int, hi: int, device: st
     del gpu_frame, diff, mask
     return result
 
+def _torch_process_batch(frames: np.ndarray, gpu_bg, lo: int, hi: int, device: str) -> np.ndarray:
+    import torch
+    gpu_frames = torch.from_numpy(frames.copy()).to(device=device, dtype=torch.int16)
+    diff = torch.abs(gpu_bg.unsqueeze(0) - gpu_frames).to(dtype=torch.uint8)
+    masks = ((diff >= lo) & (diff <= hi)).to(dtype=torch.uint8) * 255
+    result = masks.cpu().numpy()
+    del gpu_frames, diff, masks
+    if 'cuda' in device:
+        torch.cuda.empty_cache()
+    return result
+
 def _torch_release_background(gpu_bg, device: str) -> None:
     import torch
     del gpu_bg
@@ -331,7 +356,38 @@ else:
     gpu_process_frame = _numpy_process_frame
     gpu_release_background = _numpy_release_background
 
+if GPU_BACKEND == "cupy":
+    gpu_process_batch = _cupy_process_batch
+elif GPU_BACKEND in ("torch_cuda", "torch_rocm"):
+    gpu_process_batch = lambda frames, gpu_bg, lo, hi: _torch_process_batch(frames, gpu_bg, lo, hi, "cuda")
+elif GPU_BACKEND == "torch_dml":
+    gpu_process_batch = lambda frames, gpu_bg, lo, hi: _torch_process_batch(frames, gpu_bg, lo, hi, str(_dml_device()))
+else:
+    gpu_process_batch = _numpy_process_batch
+
 GPU_ACCELERATED = GPU_BACKEND != "cpu"
+
+
+def compute_batch_size(h: int, w: int, vram_fraction: float = 0.8) -> int:
+    """Returns frames-per-GPU-batch using vram_fraction of free VRAM.
+
+    Called *after* the background is already uploaded so its footprint is
+    already deducted from the free-VRAM reading.
+    Each frame costs 5 bytes of VRAM: int16 upload (2) + int16 diff (2) + uint8 mask (1).
+    """
+    bytes_per_frame = h * w * 5
+    if GPU_BACKEND == "cupy":
+        import cupy as cp
+        free = cp.cuda.Device(0).mem_info[0]
+    elif GPU_BACKEND in ("torch_cuda", "torch_rocm"):
+        import torch
+        free = torch.cuda.mem_get_info(0)[0]
+    elif GPU_BACKEND == "torch_dml":
+        free = 2 * 1024 ** 3  # DirectML has no reliable free-VRAM query
+    else:
+        return 32  # CPU/NumPy: modest batch still helps vectorisation
+    usable = int(free * vram_fraction)
+    return max(1, min(usable // bytes_per_frame, 2000))
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +464,7 @@ class ProcessingResult:
     processing_time: float
     error_message: Optional[str] = None
     quality_flag: str = "normal"
+    batch_size: int = 0
 
 
 class BatchWormTracker:
@@ -749,8 +806,14 @@ class BatchWormTracker:
             self.logger.info(f"Uploading background to GPU ({GPU_BACKEND})…")
             gpu_bg = gpu_upload_background(background)
             try:
+                batch_size = compute_batch_size(*background.shape[:2])
+                result.batch_size = batch_size
+                self.logger.info(
+                    f"GPU batch size: {batch_size} frames "
+                    f"(~{batch_size * background.shape[0] * background.shape[1] * 5 / 1e9:.2f} GB VRAM, "
+                    f"80% of free)")
                 tracks, nose_tracks, track_statistics = self._run_tracking(
-                    image_files, background.shape[:2], gpu_bg, progress_callback)
+                    image_files, background.shape[:2], gpu_bg, batch_size, progress_callback)
             finally:
                 gpu_release_background(gpu_bg)
             if not tracks:
@@ -784,8 +847,51 @@ class BatchWormTracker:
             return "noisy"
         return "normal"
 
+    def _batched_frame_iter(self, image_files: List[str], gpu_bg, bg_shape: Tuple[int, int],
+                            lo: int, hi: int, batch_size: int):
+        """Generator yielding (img, mask) pairs with GPU work batched batch_size frames at a time.
+
+        Maintains correct frame order even when individual loads fail — failed frames yield
+        (None, None) in position without consuming a GPU batch slot.
+        """
+        h, w = bg_shape
+        buf = np.empty((batch_size, h, w), dtype=np.uint8)
+        buf_size = max(batch_size * 2, ImagePrefetcher.N_IO_WORKERS * 6)
+
+        def _process(slot_imgs, n_valid):
+            if n_valid == 0:
+                return [(None, None)] * len(slot_imgs)
+            masks = gpu_process_batch(buf[:n_valid], gpu_bg, lo, hi)
+            results = []
+            mi = 0
+            for img in slot_imgs:
+                if img is not None:
+                    results.append((img, masks[mi])); mi += 1
+                else:
+                    results.append((None, None))
+            return results
+
+        slot_imgs = []
+        n_valid = 0
+        for img_path, preloaded in ImagePrefetcher(image_files, buffer_size=buf_size):
+            img = preloaded if preloaded is not None else cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+            if img is not None:
+                if img.shape != bg_shape:
+                    img = cv2.resize(img, (w, h))
+                if img.dtype != np.uint8:
+                    img = img.astype(np.uint8, copy=False)
+                buf[n_valid] = img
+                n_valid += 1
+            slot_imgs.append(img)
+            if len(slot_imgs) == batch_size:
+                yield from _process(slot_imgs, n_valid)
+                slot_imgs = []
+                n_valid = 0
+        if slot_imgs:
+            yield from _process(slot_imgs, n_valid)
+
     def _run_tracking(self, image_files: List[str], bg_shape: Tuple[int, int], gpu_bg,
-                      progress_callback=None) -> Tuple[Dict, Dict, List]:
+                      batch_size: int, progress_callback=None) -> Tuple[Dict, Dict, List]:
         next_track_id = 1
         active_tracks = {}
         inactive_tracks = {}
@@ -796,14 +902,12 @@ class BatchWormTracker:
         lo = max(0, min(255, self.config.threshold_min))
         hi = max(lo, min(255, self.config.threshold_max))
 
-        prefetcher = ImagePrefetcher(image_files)
-        for frame_idx, (img_path, preloaded_img) in enumerate(prefetcher):
+        for frame_idx, (img, mask) in enumerate(
+                self._batched_frame_iter(image_files, gpu_bg, bg_shape, lo, hi, batch_size)):
             try:
                 if progress_callback:
                     progress_callback(frame_idx + 1, total_frames)
 
-                img, mask = self.load_and_process_frame(
-                    img_path, gpu_bg, bg_shape, lo, hi, preloaded_img=preloaded_img)
                 if img is None or mask is None:
                     continue
 
@@ -1485,7 +1589,7 @@ class BatchWormTrackerGUI:
         msg = (f"Process {len(self.directories)} directories?\n\n"
                f"Compute: {backend_str}\n"
                f"Background: GPU tiled median, image loading: {N_WORKERS} threads\n"
-               f"Tracking: sequential with I/O prefetch (12 frames ahead)\n\n"
+               f"Tracking: GPU batched (auto-sized to 80% free VRAM)\n\n"
                "tracks_debug.csv will be saved (overwriting existing).")
         if not messagebox.askyesno("Confirm", msg): return
         self.results.clear(); self.results_text.delete(1.0, tk.END)
@@ -1532,7 +1636,8 @@ class BatchWormTrackerGUI:
         status = "SUCCESS" if r.success else "FAILED"
         quality = {"normal": "NORMAL", "noisy": "NOISY", "empty": "EMPTY"}[r.quality_flag]
         t = f"\n[{status}] {os.path.basename(r.directory)} [{quality}]\n"
-        t += f"   Images: {r.num_images}, Tracks: {r.num_accepted_tracks}, Time: {r.processing_time:.1f}s\n"
+        batch_info = f", Batch: {r.batch_size} frames" if r.batch_size else ""
+        t += f"   Images: {r.num_images}, Tracks: {r.num_accepted_tracks}, Time: {r.processing_time:.1f}s{batch_info}\n"
         if r.quality_flag == "noisy": t += "   WARNING: HIGH TRACK COUNT\n"
         elif r.quality_flag == "empty": t += "   WARNING: NO TRACKS FOUND\n"
         if not r.success: t += f"   Error: {r.error_message}\n"
@@ -1570,7 +1675,7 @@ class BatchWormTrackerGUI:
             s += "  CPU (NumPy) — no GPU backend\n"
         s += f"  I/O threads: {ImagePrefetcher.N_IO_WORKERS} prefetch, {N_WORKERS} bg-gen (of {os.cpu_count()} cores)\n"
         s += "  Background: parallel image loading + GPU tiled median\n"
-        s += "  Tracking: GPU per-frame pipeline + parallel I/O prefetch\n\n"
+        s += "  Tracking: GPU batched (auto-sized to 80% free VRAM) + parallel I/O prefetch\n\n"
 
         s += "Config:\n"
         s += f"  Thresh: {self.config.threshold_min}-{self.config.threshold_max} | "
