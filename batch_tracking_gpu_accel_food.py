@@ -41,7 +41,7 @@ from dataclasses import dataclass
 N_WORKERS = max(1, (os.cpu_count() or 4) * 3 // 4)
 
 # ---------------------------------------------------------------------------
-# GPU backend detection — sets gpu_median, gpu_absdiff, gpu_inrange
+# GPU backend detection — sets gpu_median, gpu_upload_background, gpu_process_frame, gpu_release_background
 # ---------------------------------------------------------------------------
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -158,30 +158,29 @@ elif IS_WINDOWS and _gpu_vendor == "amd":
     _try_torch_directml()
 elif IS_LINUX and _gpu_vendor == "nvidia":
     _try_cupy() or _try_torch_cuda()
-elif IS_LINUX and _gpu_vendor == "amd":
-    _try_torch_rocm()
-elif IS_LINUX and _gpu_vendor == "unknown":
-    # OpenCL ICD unavailable (common in conda envs) — try PyTorch directly.
-    # If launched via launcher.py the HSA override is already inherited.
-    # If run directly, probe for the right GFX version before torch is imported
-    # (HSA locks in the version at first torch import; subprocess gives a fresh
-    # context for each candidate).
-    if 'HSA_OVERRIDE_GFX_VERSION' not in os.environ:
-        _GFX_PROBE = (
-            'import torch; t=torch.zeros(1,device="cuda"); '
-            'assert (t+1).item()==1.0'
-        )
-        _GFX_CANDIDATES = ['11.0.0', '10.3.0', '9.4.0', '9.0.10', '9.0.6']
-        for _ver in _GFX_CANDIDATES:
-            _env = {**os.environ, 'HSA_OVERRIDE_GFX_VERSION': _ver}
-            _r = __import__('subprocess').run(
-                [sys.executable, '-c', _GFX_PROBE],
-                env=_env, capture_output=True, timeout=20
+elif IS_LINUX and _gpu_vendor in ("amd", "unknown"):
+    # Try ROCm directly first — works if HSA is already inherited from launcher
+    # or if the GPU's GFX version is natively in the ROCm PyTorch build.
+    # If that fails, probe HSA_OVERRIDE_GFX_VERSION candidates (required for
+    # RDNA3/gfx1102 and other GFX versions not bundled in the PyTorch ROCm
+    # wheel, regardless of whether OpenCL identified the vendor or not).
+    if not _try_torch_rocm():
+        if 'HSA_OVERRIDE_GFX_VERSION' not in os.environ:
+            _GFX_PROBE = (
+                'import torch; t=torch.zeros(1,device="cuda"); '
+                'assert (t+1).item()==1.0'
             )
-            if _r.returncode == 0:
-                os.environ['HSA_OVERRIDE_GFX_VERSION'] = _ver
-                break
-    _try_torch_rocm() or _try_cupy() or _try_torch_cuda()
+            _GFX_CANDIDATES = ['11.0.2', '11.0.0', '10.3.0', '9.4.0', '9.0.10', '9.0.6']
+            for _ver in _GFX_CANDIDATES:
+                _env = {**os.environ, 'HSA_OVERRIDE_GFX_VERSION': _ver}
+                _r = __import__('subprocess').run(
+                    [sys.executable, '-c', _GFX_PROBE],
+                    env=_env, capture_output=True, timeout=20
+                )
+                if _r.returncode == 0:
+                    os.environ['HSA_OVERRIDE_GFX_VERSION'] = _ver
+                    break
+        _try_torch_rocm() or _try_cupy() or _try_torch_cuda()
 # else: stays "cpu"
 
 
@@ -192,11 +191,15 @@ elif IS_LINUX and _gpu_vendor == "unknown":
 def _numpy_median(stack: np.ndarray) -> np.ndarray:
     return np.median(stack, axis=0).astype(np.uint8)
 
-def _numpy_absdiff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    return cv2.absdiff(a, b)
+def _numpy_upload_background(bg: np.ndarray) -> np.ndarray:
+    return bg
 
-def _numpy_inrange(img: np.ndarray, lo: int, hi: int) -> np.ndarray:
-    return cv2.inRange(img, lo, hi)
+def _numpy_process_frame(frame: np.ndarray, cpu_bg: np.ndarray, lo: int, hi: int) -> np.ndarray:
+    diff = cv2.absdiff(cpu_bg, frame)
+    return cv2.inRange(diff, lo, hi)
+
+def _numpy_release_background(_bg) -> None:
+    pass
 
 
 def _cupy_median(stack: np.ndarray) -> np.ndarray:
@@ -229,20 +232,23 @@ def _cupy_median(stack: np.ndarray) -> np.ndarray:
 
     return result
 
-def _cupy_absdiff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+def _cupy_upload_background(bg: np.ndarray):
     import cupy as cp
-    ga, gb = cp.asarray(a), cp.asarray(b)
-    result = cp.asnumpy(cp.abs(ga.astype(cp.int16) - gb.astype(cp.int16)).astype(cp.uint8))
-    del ga, gb
+    return cp.asarray(bg, dtype=cp.int16)
+
+def _cupy_process_frame(frame: np.ndarray, gpu_bg, lo: int, hi: int) -> np.ndarray:
+    import cupy as cp
+    gpu_frame = cp.asarray(frame, dtype=cp.int16)
+    diff = cp.abs(gpu_bg - gpu_frame).astype(cp.uint8)
+    mask = ((diff >= lo) & (diff <= hi)).astype(cp.uint8) * 255
+    result = cp.asnumpy(mask)
+    del gpu_frame, diff, mask
     return result
 
-def _cupy_inrange(img: np.ndarray, lo: int, hi: int) -> np.ndarray:
+def _cupy_release_background(gpu_bg) -> None:
     import cupy as cp
-    gi = cp.asarray(img)
-    mask = ((gi >= lo) & (gi <= hi)).astype(cp.uint8) * 255
-    result = cp.asnumpy(mask)
-    del gi, mask
-    return result
+    del gpu_bg
+    cp.get_default_memory_pool().free_all_blocks()
 
 
 def _torch_median(stack: np.ndarray, device: str) -> np.ndarray:
@@ -280,43 +286,50 @@ def _torch_median(stack: np.ndarray, device: str) -> np.ndarray:
 
     return result
 
-def _torch_absdiff(a: np.ndarray, b: np.ndarray, device: str) -> np.ndarray:
+def _torch_upload_background(bg: np.ndarray, device: str):
     import torch
-    ta = torch.from_numpy(a).to(device=device, dtype=torch.int16)
-    tb = torch.from_numpy(b).to(device=device, dtype=torch.int16)
-    result = torch.abs(ta - tb).to(dtype=torch.uint8).cpu().numpy()
-    del ta, tb
+    return torch.from_numpy(bg.copy()).to(device=device, dtype=torch.int16)
+
+def _torch_process_frame(frame: np.ndarray, gpu_bg, lo: int, hi: int, device: str) -> np.ndarray:
+    import torch
+    gpu_frame = torch.from_numpy(frame).to(device=device, dtype=torch.int16)
+    diff = torch.abs(gpu_bg - gpu_frame).to(dtype=torch.uint8)
+    mask = ((diff >= lo) & (diff <= hi)).to(dtype=torch.uint8) * 255
+    result = mask.cpu().numpy()
+    del gpu_frame, diff, mask
     return result
 
-def _torch_inrange(img: np.ndarray, lo: int, hi: int, device: str) -> np.ndarray:
+def _torch_release_background(gpu_bg, device: str) -> None:
     import torch
-    t = torch.from_numpy(img).to(device=device)
-    mask = ((t >= lo) & (t <= hi)).to(dtype=torch.uint8) * 255
-    result = mask.cpu().numpy()
-    del t, mask
-    return result
+    del gpu_bg
+    if "cuda" in device:
+        torch.cuda.empty_cache()
 
 
 # --- Bind the right implementation ---
-# Median: GPU when available (the heavy compute that benefits from acceleration)
 if GPU_BACKEND == "cupy":
     gpu_median = _cupy_median
-elif GPU_BACKEND == "torch_cuda":
+    gpu_upload_background = _cupy_upload_background
+    gpu_process_frame = _cupy_process_frame
+    gpu_release_background = _cupy_release_background
+elif GPU_BACKEND in ("torch_cuda", "torch_rocm"):
     gpu_median = lambda stack: _torch_median(stack, "cuda")
-elif GPU_BACKEND == "torch_rocm":
-    gpu_median = lambda stack: _torch_median(stack, "cuda")
+    gpu_upload_background = lambda bg: _torch_upload_background(bg, "cuda")
+    gpu_process_frame = lambda frame, gpu_bg, lo, hi: _torch_process_frame(frame, gpu_bg, lo, hi, "cuda")
+    gpu_release_background = lambda gpu_bg: _torch_release_background(gpu_bg, "cuda")
 elif GPU_BACKEND == "torch_dml":
     def _dml_device():
         import torch_directml
         return torch_directml.device()
     gpu_median = lambda stack: _torch_median(stack, str(_dml_device()))
+    gpu_upload_background = lambda bg: _torch_upload_background(bg, str(_dml_device()))
+    gpu_process_frame = lambda frame, gpu_bg, lo, hi: _torch_process_frame(frame, gpu_bg, lo, hi, str(_dml_device()))
+    gpu_release_background = lambda gpu_bg: _torch_release_background(gpu_bg, str(_dml_device()))
 else:
     gpu_median = _numpy_median
-
-# Per-frame ops: always CPU. GPU transfer overhead per frame exceeds compute
-# savings, especially with parallel directory processing.
-gpu_absdiff = _numpy_absdiff
-gpu_inrange = _numpy_inrange
+    gpu_upload_background = _numpy_upload_background
+    gpu_process_frame = _numpy_process_frame
+    gpu_release_background = _numpy_release_background
 
 GPU_ACCELERATED = GPU_BACKEND != "cpu"
 
@@ -328,17 +341,34 @@ GPU_ACCELERATED = GPU_BACKEND != "cpu"
 # ---------------------------------------------------------------------------
 
 class ImagePrefetcher:
-    """Reads images from disk in a background thread, buffering ahead."""
+    """Reads images from disk in parallel, buffering ahead.
 
-    def __init__(self, image_files: List[str], buffer_size: int = 12):
+    Worker count is capped at 4 regardless of core count: HDD seek contention
+    makes additional threads counterproductive beyond that point. The benefit
+    is overlap (reading N+1 while GPU/CPU processes N), not raw throughput.
+    """
+
+    # HDD-safe worker count: overlap without seek contention
+    N_IO_WORKERS = max(2, min(4, (os.cpu_count() or 4) // 4))
+
+    def __init__(self, image_files: List[str], buffer_size: int = None):
+        if buffer_size is None:
+            buffer_size = self.N_IO_WORKERS * 6
+        self._files = image_files
         self._queue = queue.Queue(maxsize=buffer_size)
-        self._thread = threading.Thread(target=self._worker, args=(image_files,), daemon=True)
+        self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
 
-    def _worker(self, image_files):
-        for path in image_files:
-            img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-            self._queue.put((path, img))
+    def _worker(self):
+        def _load(path):
+            return path, cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+
+        chunk_size = self.N_IO_WORKERS * 3
+        with ThreadPoolExecutor(max_workers=self.N_IO_WORKERS) as pool:
+            for i in range(0, len(self._files), chunk_size):
+                chunk = self._files[i:i + chunk_size]
+                for result in pool.map(_load, chunk):
+                    self._queue.put(result)
         self._queue.put(None)
 
     def __iter__(self):
@@ -468,21 +498,17 @@ class BatchWormTracker:
         self.logger.info(f"Background generated (median, {GPU_BACKEND}) from {len(sampled_files)} images")
         return background
 
-    def apply_threshold(self, image: np.ndarray) -> Tuple[np.ndarray, List[np.ndarray]]:
-        """Apply threshold + blob-size filtering via gpu_inrange."""
-        if image is None or image.size == 0:
+    def apply_threshold(self, mask: np.ndarray) -> Tuple[np.ndarray, List[np.ndarray]]:
+        """Blob-size filter on a GPU-produced thresholded mask."""
+        if mask is None or mask.size == 0:
             return np.zeros((100, 100), dtype=np.uint8), []
 
         try:
-            min_thresh = max(0, min(255, self.config.threshold_min))
-            max_thresh = max(min_thresh, min(255, self.config.threshold_max))
             min_blob = max(1, self.config.min_blob_size)
             max_blob = max(min_blob, self.config.max_blob_size)
 
-            thresholded = gpu_inrange(image, min_thresh, max_thresh)
-
-            raw_contours, _ = cv2.findContours(thresholded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            filtered = np.zeros_like(thresholded)
+            raw_contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            filtered = np.zeros_like(mask)
             kept_contours = []
             for contour in raw_contours:
                 area = cv2.contourArea(contour)
@@ -493,24 +519,23 @@ class BatchWormTracker:
             return filtered, kept_contours
         except Exception as e:
             self.logger.error(f"Error in apply_threshold: {e}")
-            return np.zeros_like(image), []
+            return np.zeros_like(mask), []
 
-    def load_and_process_frame(self, image_path: str, background: np.ndarray, preloaded_img: Optional[np.ndarray] = None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """Load and background-subtract a frame via gpu_absdiff."""
+    def load_and_process_frame(self, image_path: str, gpu_bg, bg_shape: Tuple[int, int],
+                               lo: int, hi: int,
+                               preloaded_img: Optional[np.ndarray] = None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Load a frame and return (original, thresholded_mask) in one GPU roundtrip."""
         img = preloaded_img if preloaded_img is not None else cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
         if img is None:
             return None, None
 
-        if background is not None:
-            if img.shape != background.shape:
-                img = cv2.resize(img, (background.shape[1], background.shape[0]))
-            if img.dtype != background.dtype:
-                img = img.astype(background.dtype, copy=False)
-            subtracted = gpu_absdiff(background, img)
-        else:
-            subtracted = img
+        if img.shape != bg_shape:
+            img = cv2.resize(img, (bg_shape[1], bg_shape[0]))
+        if img.dtype != np.uint8:
+            img = img.astype(np.uint8, copy=False)
 
-        return img, subtracted
+        mask = gpu_process_frame(img, gpu_bg, lo, hi)
+        return img, mask
 
     # --- Everything below is IDENTICAL to batch_tracking_gpu.py ---
 
@@ -721,7 +746,13 @@ class BatchWormTracker:
                 result.error_message = "Failed to generate background"
                 return result
 
-            tracks, nose_tracks, track_statistics = self._run_tracking(image_files, background, progress_callback)
+            self.logger.info(f"Uploading background to GPU ({GPU_BACKEND})…")
+            gpu_bg = gpu_upload_background(background)
+            try:
+                tracks, nose_tracks, track_statistics = self._run_tracking(
+                    image_files, background.shape[:2], gpu_bg, progress_callback)
+            finally:
+                gpu_release_background(gpu_bg)
             if not tracks:
                 result.error_message = "No tracks generated"
                 return result
@@ -753,7 +784,8 @@ class BatchWormTracker:
             return "noisy"
         return "normal"
 
-    def _run_tracking(self, image_files: List[str], background: np.ndarray, progress_callback=None) -> Tuple[Dict, Dict, List]:
+    def _run_tracking(self, image_files: List[str], bg_shape: Tuple[int, int], gpu_bg,
+                      progress_callback=None) -> Tuple[Dict, Dict, List]:
         next_track_id = 1
         active_tracks = {}
         inactive_tracks = {}
@@ -761,17 +793,21 @@ class BatchWormTracker:
         MAX_MISSING_FRAMES = 5
         total_frames = len(image_files)
 
+        lo = max(0, min(255, self.config.threshold_min))
+        hi = max(lo, min(255, self.config.threshold_max))
+
         prefetcher = ImagePrefetcher(image_files)
         for frame_idx, (img_path, preloaded_img) in enumerate(prefetcher):
             try:
                 if progress_callback:
                     progress_callback(frame_idx + 1, total_frames)
 
-                img, subtracted = self.load_and_process_frame(img_path, background, preloaded_img=preloaded_img)
-                if img is None or subtracted is None:
+                img, mask = self.load_and_process_frame(
+                    img_path, gpu_bg, bg_shape, lo, hi, preloaded_img=preloaded_img)
+                if img is None or mask is None:
                     continue
 
-                thresholded, valid_contours = self.apply_threshold(subtracted)
+                thresholded, valid_contours = self.apply_threshold(mask)
 
                 centroids = []
                 kept_contours = []
@@ -1217,7 +1253,7 @@ class BatchWormTrackerGUI:
         ttk.Label(pf, text="Current Directory:").pack(anchor='w')
         self.current_progress = ttk.Progressbar(pf, mode='determinate')
         self.current_progress.pack(fill='x', pady=(2, 10))
-        self.status_label = ttk.Label(pf, text=f"Ready — {N_WORKERS} threads for I/O ({os.cpu_count()} cores detected)")
+        self.status_label = ttk.Label(pf, text=f"Ready — {ImagePrefetcher.N_IO_WORKERS} I/O threads, {N_WORKERS} bg threads ({os.cpu_count()} cores)")
         self.status_label.pack(anchor='w')
         self.current_dir_label = ttk.Label(pf, text="")
         self.current_dir_label.pack(anchor='w')
@@ -1532,9 +1568,9 @@ class BatchWormTrackerGUI:
             s += f"  {GPU_BACKEND.upper()}: {GPU_DEVICE_NAME}\n"
         else:
             s += "  CPU (NumPy) — no GPU backend\n"
-        s += f"  I/O threads: {N_WORKERS} (of {os.cpu_count()} cores)\n"
+        s += f"  I/O threads: {ImagePrefetcher.N_IO_WORKERS} prefetch, {N_WORKERS} bg-gen (of {os.cpu_count()} cores)\n"
         s += "  Background: parallel image loading + GPU tiled median\n"
-        s += "  Tracking: sequential with I/O prefetch\n\n"
+        s += "  Tracking: GPU per-frame pipeline + parallel I/O prefetch\n\n"
 
         s += "Config:\n"
         s += f"  Thresh: {self.config.threshold_min}-{self.config.threshold_max} | "
