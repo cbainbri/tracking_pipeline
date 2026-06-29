@@ -161,7 +161,11 @@ elif IS_LINUX and _gpu_vendor == "nvidia":
 elif IS_LINUX and _gpu_vendor == "amd":
     _try_torch_rocm()
 elif IS_LINUX and _gpu_vendor == "unknown":
-    # OpenCL ICD unavailable (common in conda envs) — try PyTorch directly
+    # OpenCL ICD unavailable (common in conda envs) — try PyTorch directly.
+    # Must set GFX override before torch is imported; HSA locks in the version
+    # at context init. 11.0.0 = gfx1100 (RDNA3). setdefault won't clobber a
+    # user-supplied value.
+    os.environ.setdefault('HSA_OVERRIDE_GFX_VERSION', '11.0.0')
     _try_torch_rocm() or _try_cupy() or _try_torch_cuda()
 # else: stays "cpu"
 
