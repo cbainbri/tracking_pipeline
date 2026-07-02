@@ -44,6 +44,7 @@ class BatchConfig:
     min_displacement_distance: float = 75.0
     blob_prescreen_enabled: bool = True
     max_blobs_per_frame: int = 600
+    debug: bool = False
 
 
 @dataclass
@@ -581,7 +582,8 @@ class BatchWormTracker:
                             valid_contours.append(contour)
 
                 if frame_idx % 50 == 0:
-                    print(f"  [DIAG] frame {frame_idx:4d}/{total_frames}  blobs={len(centroids):4d}  active_tracks={len(active_tracks):4d}", flush=True)
+                    if self.config.debug:
+                        print(f"  [DIAG] frame {frame_idx:4d}/{total_frames}  blobs={len(centroids):4d}  active_tracks={len(active_tracks):4d}", flush=True)
 
                 # FIXED: Deactivate old tracks (same as main tracker)
                 tracks_to_deactivate = []
