@@ -42,6 +42,8 @@ class BatchConfig:
     min_movement_threshold: float = 2.0
     filter_stationary_tracks: bool = True
     min_displacement_distance: float = 75.0
+    blob_prescreen_enabled: bool = True
+    max_blobs_per_frame: int = 600
 
 
 @dataclass
@@ -54,7 +56,8 @@ class ProcessingResult:
     num_accepted_tracks: int
     processing_time: float
     error_message: Optional[str] = None
-    quality_flag: str = "normal"  # "normal", "noisy", "empty"
+    quality_flag: str = "normal"  # "normal", "noisy", "empty", "prescreened_skip"
+    prescreen_blob_avg: float = 0.0
 
 
 class BatchWormTracker:
@@ -250,29 +253,30 @@ class BatchWormTracker:
         distance_matrix = cdist(track_positions_array, centroid_positions_array)
 
         if self.config.trajectory_weight > 0:
-            trajectory_matrix = np.full_like(distance_matrix, np.inf)
+            tw = self.config.trajectory_weight
+            max_d = self.config.max_distance
 
-            for i, predicted_pos in enumerate(track_predictions):
-                if predicted_pos is not None:
-                    pred_distances = cdist([predicted_pos], centroid_positions_array)[0]
-                    for j in range(len(pred_distances)):
-                        if pred_distances[j] < self.config.max_distance * 2:
-                            trajectory_matrix[i, j] = pred_distances[j]
+            trajectory_matrix = np.full_like(distance_matrix, np.inf)
+            valid_indices = [i for i, p in enumerate(track_predictions) if p is not None]
+            if valid_indices:
+                valid_preds = np.array([track_predictions[i] for i in valid_indices])
+                pred_dist_matrix = cdist(valid_preds, centroid_positions_array)
+                pred_dist_matrix[pred_dist_matrix >= max_d * 2] = np.inf
+                trajectory_matrix[valid_indices] = pred_dist_matrix
 
             combined_matrix = np.full_like(distance_matrix, np.inf)
-            for i in range(len(track_ids)):
-                for j in range(len(centroids)):
-                    dist_score = distance_matrix[i, j]
-                    traj_score = trajectory_matrix[i, j]
+            dist_near = distance_matrix < max_d
+            traj_finite = np.isfinite(trajectory_matrix)
+            traj_near = trajectory_matrix < max_d * 1.5
 
-                    if dist_score < self.config.max_distance and traj_score < np.inf:
-                        combined_score = (1 - self.config.trajectory_weight) * dist_score + \
-                                       self.config.trajectory_weight * traj_score
-                        combined_matrix[i, j] = combined_score
-                    elif dist_score < self.config.max_distance:
-                        combined_matrix[i, j] = dist_score * (1 + self.config.trajectory_weight * 0.5)
-                    elif traj_score < self.config.max_distance * 1.5:
-                        combined_matrix[i, j] = traj_score * (1 + (1 - self.config.trajectory_weight) * 0.5)
+            mask1 = dist_near & traj_finite
+            combined_matrix[mask1] = (1 - tw) * distance_matrix[mask1] + tw * trajectory_matrix[mask1]
+
+            mask2 = dist_near & ~traj_finite
+            combined_matrix[mask2] = distance_matrix[mask2] * (1 + tw * 0.5)
+
+            mask3 = ~dist_near & traj_near
+            combined_matrix[mask3] = trajectory_matrix[mask3] * (1 + (1 - tw) * 0.5)
         else:
             combined_matrix = distance_matrix.copy()
 
@@ -424,7 +428,30 @@ class BatchWormTracker:
         displacement = np.sqrt((last_pos[0] - first_pos[0])**2 + (last_pos[1] - first_pos[1])**2)
         return displacement
 
-    def process_directory(self, image_directory: str, progress_callback=None) -> ProcessingResult:
+    def _prescreen_blob_count(self, image_files: List[str], background: np.ndarray) -> float:
+        """Sample 10 frames and return average blobs/frame as a noise estimate."""
+        indices = np.linspace(0, len(image_files) - 1, min(10, len(image_files)), dtype=int)
+        lo = max(0, min(255, self.config.threshold_min))
+        hi = max(lo, min(255, self.config.threshold_max))
+        counts = []
+        for idx in indices:
+            try:
+                img = cv2.imread(image_files[idx], cv2.IMREAD_GRAYSCALE)
+                if img is None:
+                    continue
+                if img.shape != background.shape:
+                    img = cv2.resize(img, (background.shape[1], background.shape[0]))
+                diff = cv2.absdiff(background, img)
+                mask = cv2.inRange(diff, lo, hi)
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                count = sum(1 for c in contours
+                            if self.config.min_blob_size <= cv2.contourArea(c) <= self.config.max_blob_size)
+                counts.append(count)
+            except Exception:
+                continue
+        return float(np.mean(counts)) if counts else 0.0
+
+    def process_directory(self, image_directory: str, progress_callback=None, prescreen_callback=None) -> ProcessingResult:
         """Process a single image directory"""
         start_time = time.time()
         result = ProcessingResult(
@@ -453,6 +480,26 @@ class BatchWormTracker:
             if background is None:
                 result.error_message = "Failed to generate background"
                 return result
+
+            # Pre-screen: sample frames to estimate noise before full processing
+            if self.config.blob_prescreen_enabled:
+                avg_blobs = self._prescreen_blob_count(image_files, background)
+                result.prescreen_blob_avg = avg_blobs
+                self.logger.info(f"Pre-screen: {avg_blobs:.0f} avg blobs/frame (limit: {self.config.max_blobs_per_frame})")
+                if avg_blobs > self.config.max_blobs_per_frame:
+                    should_continue = prescreen_callback(avg_blobs) if prescreen_callback else False
+                    if not should_continue:
+                        note_path = os.path.join(image_directory, "SKIPPED_TOO_NOISY.txt")
+                        with open(note_path, 'w') as f:
+                            f.write(f"Directory skipped by batch tracker pre-screen\n")
+                            f.write(f"Average blobs/frame: {avg_blobs:.0f}\n")
+                            f.write(f"Limit: {self.config.max_blobs_per_frame}\n")
+                            f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                        result.quality_flag = "prescreened_skip"
+                        result.error_message = f"Pre-screened: {avg_blobs:.0f} avg blobs/frame exceeds limit of {self.config.max_blobs_per_frame}"
+                        result.processing_time = time.time() - start_time
+                        self.logger.info(f"Skipped {image_directory} — {avg_blobs:.0f} avg blobs/frame")
+                        return result
 
             # Run tracking
             tracks, nose_tracks, track_statistics = self._run_tracking(image_files, background, progress_callback)
@@ -532,6 +579,9 @@ class BatchWormTracker:
                             cy = M["m01"] / M["m00"]
                             centroids.append((cx, cy))
                             valid_contours.append(contour)
+
+                if frame_idx % 50 == 0:
+                    print(f"  [DIAG] frame {frame_idx:4d}/{total_frames}  blobs={len(centroids):4d}  active_tracks={len(active_tracks):4d}", flush=True)
 
                 # FIXED: Deactivate old tracks (same as main tracker)
                 tracks_to_deactivate = []
@@ -644,8 +694,12 @@ class BatchWormTracker:
 
     def _export_tracks_csv(self, tracks: Dict, nose_tracks: Dict, csv_path: str):
         """Export tracks to CSV file"""
-        all_frames = sorted({pos[2] for positions in tracks.values() for pos in positions})
         track_ids = sorted(tracks.keys())
+        all_frames = sorted({pos[2] for positions in tracks.values() for pos in positions})
+
+        # Pre-index by frame for O(1) lookup instead of O(track_length) linear scan
+        centroid_by_frame = {tid: {p[2]: (p[0], p[1]) for p in pos} for tid, pos in tracks.items()}
+        nose_by_frame = {tid: {p[2]: (p[0], p[1]) for p in pos} for tid, pos in nose_tracks.items()}
 
         columns = ['frame']
         for tid in track_ids:
@@ -654,29 +708,15 @@ class BatchWormTracker:
         data = []
         for frame in all_frames:
             row = [frame]
-            for track_id in track_ids:
-                # Centroid position
-                centroid_pos = next(((p[0], p[1]) for p in tracks[track_id] if p[2] == frame), None)
-                if centroid_pos:
-                    row.extend([round(centroid_pos[0], 4), round(centroid_pos[1], 4)])
-                else:
-                    row.extend([None, None])
-
-                # Nose position
-                nose_pos = None
-                if track_id in nose_tracks:
-                    nose_pos = next(((p[0], p[1]) for p in nose_tracks[track_id] if p[2] == frame), None)
-
-                if nose_pos:
-                    row.extend([round(nose_pos[0], 4), round(nose_pos[1], 4)])
-                else:
-                    row.extend([None, None])
-
+            for tid in track_ids:
+                pos = centroid_by_frame[tid].get(frame)
+                row.extend([round(pos[0], 4), round(pos[1], 4)] if pos else [None, None])
+                nose = nose_by_frame.get(tid, {}).get(frame)
+                row.extend([round(nose[0], 4), round(nose[1], 4)] if nose else [None, None])
             data.append(row)
 
         df = pd.DataFrame(data, columns=columns)
 
-        # Overwrite existing file if it exists
         if os.path.exists(csv_path):
             self.logger.info(f"Overwriting existing tracks.csv at {csv_path}")
 
@@ -935,6 +975,7 @@ class BatchWormTrackerGUI:
         self.create_blob_config(scrollable_frame)
         self.create_tracking_config(scrollable_frame)
         self.create_nose_config(scrollable_frame)
+        self.create_prescreen_config(scrollable_frame)
         self.create_action_buttons(scrollable_frame)
 
     def create_threshold_config(self, parent):
@@ -1096,6 +1137,52 @@ class BatchWormTrackerGUI:
         # Info label
         ttk.Label(nose_frame, text="Detects worm front based on locomotion direction",
                  font=('TkDefaultFont', 8), foreground='gray').pack(anchor='w', pady=(5,0))
+
+    def create_prescreen_config(self, parent):
+        """Create pre-screen configuration section"""
+        frame = ttk.LabelFrame(parent, text="Pre-screen: Skip Noisy Directories", padding="10")
+        frame.pack(fill='x', padx=5, pady=5)
+
+        ef = ttk.Frame(frame)
+        ef.pack(fill='x', pady=2)
+        self.prescreen_enabled_var = tk.BooleanVar(value=self.config.blob_prescreen_enabled)
+        ttk.Checkbutton(ef, text="Enable blob pre-screen", variable=self.prescreen_enabled_var,
+                       command=self.update_prescreen).pack(side='left', anchor='w')
+
+        mf = ttk.Frame(frame)
+        mf.pack(fill='x', pady=2)
+        ttk.Label(mf, text="Max avg blobs/frame:").pack(side='left', anchor='w')
+        self.max_blobs_var = tk.StringVar(value=str(self.config.max_blobs_per_frame))
+        ttk.Entry(mf, textvariable=self.max_blobs_var, width=10).pack(side='right')
+        self.max_blobs_var.trace_add('write', lambda *_: self.validate_prescreen_params())
+
+        af = ttk.Frame(frame)
+        af.pack(fill='x', pady=2)
+        ttk.Label(af, text="If exceeded:").pack(side='left', anchor='w')
+        self.noisy_action_var = tk.StringVar(value="Skip with notification")
+        ttk.Combobox(af, textvariable=self.noisy_action_var,
+                    values=["Skip with notification", "Flag and continue", "Ask me each time"],
+                    width=22, state="readonly").pack(side='right')
+
+        ttk.Label(frame, text="Skip: writes SKIPPED_TOO_NOISY.txt to directory and shows in results.",
+                 font=('TkDefaultFont', 8), foreground='gray').pack(anchor='w', pady=(5, 0))
+
+    def update_prescreen(self):
+        self.config.blob_prescreen_enabled = self.prescreen_enabled_var.get()
+        self.update_config_summary()
+
+    def validate_prescreen_params(self, event=None):
+        try:
+            val = int(self.max_blobs_var.get())
+            if val < 1:
+                raise ValueError
+            self.config.max_blobs_per_frame = val
+            self.update_config_summary()
+            return True
+        except ValueError:
+            if self.max_blobs_var.get():
+                self.config_status_label.config(text="Invalid max blobs value", foreground='red')
+            return False
 
     def create_action_buttons(self, parent):
         """Create action buttons for configuration"""
@@ -1329,6 +1416,9 @@ class BatchWormTrackerGUI:
         self.nose_movement_var.set(str(self.config.min_movement_threshold))
         self.filter_stationary_var.set(self.config.filter_stationary_tracks)
         self.min_displacement_var.set(str(self.config.min_displacement_distance))
+        self.prescreen_enabled_var.set(self.config.blob_prescreen_enabled)
+        self.max_blobs_var.set(str(self.config.max_blobs_per_frame))
+        self.noisy_action_var.set("Skip with notification")
 
         self.config_status_label.config(text="Reset to defaults", foreground='green')
         self.tracker = BatchWormTracker(self.config)
@@ -1384,6 +1474,9 @@ class BatchWormTrackerGUI:
                 f.write(f"min_movement_threshold={self.config.min_movement_threshold}\n")
                 f.write(f"filter_stationary_tracks={self.config.filter_stationary_tracks}\n")
                 f.write(f"min_displacement_distance={self.config.min_displacement_distance}\n")
+                f.write(f"blob_prescreen_enabled={self.config.blob_prescreen_enabled}\n")
+                f.write(f"max_blobs_per_frame={self.config.max_blobs_per_frame}\n")
+                f.write(f"noisy_action={self.noisy_action_var.get()}\n")
 
             messagebox.showinfo("Configuration Saved", f"Configuration saved to:\n{file_path}")
         except Exception as e:
@@ -1451,6 +1544,14 @@ class BatchWormTrackerGUI:
                             elif key == 'min_displacement_distance':
                                 self.config.min_displacement_distance = float(value)
                                 self.min_displacement_var.set(value)
+                            elif key == 'blob_prescreen_enabled':
+                                self.config.blob_prescreen_enabled = value.lower() == 'true'
+                                self.prescreen_enabled_var.set(self.config.blob_prescreen_enabled)
+                            elif key == 'max_blobs_per_frame':
+                                self.config.max_blobs_per_frame = int(value)
+                                self.max_blobs_var.set(value)
+                            elif key == 'noisy_action':
+                                self.noisy_action_var.set(value)
                         except ValueError:
                             continue
 
@@ -1584,8 +1685,36 @@ class BatchWormTrackerGUI:
 
                 self.root.after(0, lambda: self.current_progress.config(maximum=100, value=0))
 
+                # Pre-screen callback — behaviour depends on user's dropdown selection
+                action = self.noisy_action_var.get()
+                def make_prescreen_callback(dir_path, chosen_action):
+                    def callback(avg_blobs):
+                        if chosen_action == "Flag and continue":
+                            self.root.after(0, lambda: self.update_current_dir_status(
+                                f"WARNING: {os.path.basename(dir_path)} — {avg_blobs:.0f} blobs/frame, flagged"))
+                            return True
+                        elif chosen_action == "Ask me each time":
+                            event = threading.Event()
+                            answer = [False]
+                            def ask():
+                                answer[0] = messagebox.askyesno(
+                                    "Pre-screen: High Blob Count",
+                                    f"Directory: {os.path.basename(dir_path)}\n\n"
+                                    f"Avg blobs/frame: {avg_blobs:.0f}  (limit: {self.config.max_blobs_per_frame})\n\n"
+                                    f"Process anyway?\n(No = skip and write SKIPPED_TOO_NOISY.txt)",
+                                    parent=self.root
+                                )
+                                event.set()
+                            self.root.after(0, ask)
+                            event.wait()
+                            return answer[0]
+                        else:  # "Skip with notification"
+                            return False
+                    return callback
+
                 # Process the directory
-                result = self.tracker.process_directory(directory, progress_callback)
+                result = self.tracker.process_directory(
+                    directory, progress_callback, make_prescreen_callback(directory, action))
                 self.results.append(result)
 
                 # Update overall progress
@@ -1614,19 +1743,29 @@ class BatchWormTrackerGUI:
             return
 
         successful = len([r for r in self.results if r.success])
+        skipped = len([r for r in self.results if r.quality_flag == "prescreened_skip"])
         total = len(self.results)
-        summary = f"Processed: {total} directories | Successful: {successful} | Failed: {total - successful}"
+        summary = (f"Processed: {total} | Successful: {successful} | "
+                   f"Skipped (noisy): {skipped} | Failed: {total - successful - skipped}")
         self.results_summary_label.config(text=summary)
 
     def _format_result(self, result: ProcessingResult) -> str:
         """Format a single result for display"""
+        if result.quality_flag == "prescreened_skip":
+            text = f"\n[SKIPPED] {os.path.basename(result.directory)} [TOO NOISY — PRE-SCREENED]\n"
+            text += f"   Avg blobs/frame: {result.prescreen_blob_avg:.0f}  (limit: {self.config.max_blobs_per_frame})\n"
+            text += f"   SKIPPED_TOO_NOISY.txt written to directory.\n"
+            return text
+
         status_symbol = "SUCCESS" if result.success else "FAILED"
         quality_symbols = {"normal": "NORMAL", "noisy": "NOISY", "empty": "EMPTY"}
-        quality_symbol = quality_symbols[result.quality_flag]
+        quality_symbol = quality_symbols.get(result.quality_flag, result.quality_flag.upper())
 
         text = f"\n[{status_symbol}] {os.path.basename(result.directory)} [{quality_symbol}]\n"
         text += f"   Images: {result.num_images}, Tracks: {result.num_accepted_tracks}, Time: {result.processing_time:.1f}s\n"
 
+        if result.prescreen_blob_avg > self.config.max_blobs_per_frame:
+            text += f"   PRE-SCREEN WARNING: {result.prescreen_blob_avg:.0f} avg blobs/frame — verify output\n"
         if result.quality_flag == "noisy":
             text += f"   WARNING: HIGH TRACK COUNT - Manual QC recommended\n"
         elif result.quality_flag == "empty":
