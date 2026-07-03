@@ -493,12 +493,28 @@ class BatchWormTracker:
         image_extensions = ('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp', '.webp')
         image_files = []
         try:
-            for file in os.listdir(directory):
-                if file.lower().endswith(image_extensions):
-                    image_files.append(os.path.join(directory, file))
-            image_files.sort()
+            entries = os.listdir(directory)
         except Exception as e:
-            self.logger.error(f"Error reading directory {directory}: {e}")
+            self.logger.error(f"Cannot list directory '{directory}': {e}")
+            return image_files
+        for file in entries:
+            if file.lower().endswith(image_extensions):
+                image_files.append(os.path.join(directory, file))
+        image_files.sort()
+        if not image_files:
+            ext_counts: dict = {}
+            for f in entries:
+                ext = os.path.splitext(f)[1].lower() or '(no ext)'
+                ext_counts[ext] = ext_counts.get(ext, 0) + 1
+            if ext_counts:
+                ext_str = ', '.join(f"{e} ×{n}" for e, n in sorted(ext_counts.items()))
+                self.logger.warning(
+                    f"No recognised image files in '{directory}'. "
+                    f"Found: {ext_str}. "
+                    f"Supported: {', '.join(image_extensions)}"
+                )
+            else:
+                self.logger.warning(f"Directory is empty: '{directory}'")
         return image_files
 
     def generate_background(self, image_files: List[str]) -> Optional[np.ndarray]:
@@ -822,7 +838,19 @@ class BatchWormTracker:
             self.logger.info(f"Processing directory: {image_directory}")
             image_files = self.find_image_files(image_directory)
             if not image_files:
-                result.error_message = "No image files found"
+                try:
+                    entries = os.listdir(image_directory)
+                    ext_counts: dict = {}
+                    for f in entries:
+                        ext = os.path.splitext(f)[1].lower() or '(no ext)'
+                        ext_counts[ext] = ext_counts.get(ext, 0) + 1
+                    if ext_counts:
+                        ext_str = ', '.join(f"{e} ×{n}" for e, n in sorted(ext_counts.items()))
+                        result.error_message = f"No image files found. Directory contains: {ext_str}"
+                    else:
+                        result.error_message = "No image files found (directory appears empty)"
+                except Exception as e:
+                    result.error_message = f"No image files found (could not read directory: {e})"
                 return result
 
             result.num_images = len(image_files)
