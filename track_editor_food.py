@@ -1429,17 +1429,17 @@ class OptimizedTrackEditor:
             return
         
         try:
+            # track_manager.tracks is always stored in full original-image-
+            # resolution pixel coordinates -- loaded unscaled from CSV
+            # (load_from_dataframe) and never mutated. downsample_ratio only
+            # ever gets applied transiently by the renderer for on-screen
+            # display (see FastTrackRenderer), so there is nothing to
+            # "reverse" here. Dividing already-full-resolution coordinates
+            # by downsample_ratio (<1 for any image over MAX_DISPLAY_SIZE)
+            # inflated every saved coordinate by 1/ratio, which is the
+            # "blown up" / "tracks missing" bug reported 2026-09-21.
             df = self.track_manager.export_to_dataframe()
-            
-            # Reverse downsample scaling
-            if self.image_cache and self.image_cache.downsample_ratio < 1.0:
-                ratio = self.image_cache.downsample_ratio
-                logger.info(f"Reversing downsample scaling (ratio: {ratio:.3f})")
-                
-                for col in df.columns:
-                    if col.startswith('worm_') and ('_x' in col or '_y' in col):
-                        df[col] = df[col] / ratio
-            
+
             df.to_csv(file_path, index=False)
             logger.info(f"Saved tracks to: {file_path}")
             self.status_label.config(text=f"Saved to {os.path.basename(file_path)}")
